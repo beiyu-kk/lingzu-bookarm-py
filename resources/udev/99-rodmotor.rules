@@ -1,0 +1,3 @@
+# rodmotor fixed serial alias
+# Current rodmotor enumerates as /dev/ttyUSB4 on this machine.
+SUBSYSTEM=="tty", ATTRS{idVendor}=="10c4", ATTRS{idProduct}=="ea60", ATTRS{serial}=="0001", SYMLINK+="rodmotor", MODE="0660", GROUP="dialout"
