@@ -117,6 +117,15 @@ pip install -e ".[gui]"       # with MotorStudio GUI support
 
 Base dependencies include `numpy`, `pyyaml`, `pyserial`, `pyrealsense2`, `open3d`, and `opencv-python`. Optional: `pin` for FK/IK/gravity compensation; the `gui` extra for the MotorStudio PyQt6 UI, real-time plots, and PyVista/VTK 3D rendering.
 
+If you use the independent rod motor, install the fixed serial alias rule while setting up the project environment. MotorStudio connects to the rod motor through `/dev/rodmotor` by default:
+
+```bash
+sudo bash scripts/rodmotor_test/install_rodmotor_udev.sh
+ls -l /dev/rodmotor
+```
+
+After replacing the USB-to-serial device, if `/dev/rodmotor` does not appear, check the new device with `ls -l /dev/serial/by-id/`, update `idVendor`, `idProduct`, or `serial` in `resources/udev/99-rodmotor.rules`, then rerun the install script and replug the device.
+
 ### 3. Install MotorStudio GUI (Optional)
 
 MotorStudio provides a PyQt6-based GUI featuring 3D URDF visualization powered by **PyVista** (VTK), point-cloud picking, interactive joint drag control, and real-time monitoring.

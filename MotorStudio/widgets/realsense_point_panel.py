@@ -585,6 +585,9 @@ class RealSensePointPanel(QWidget):
     DEFAULT_TURN_STAGE1_JOINTS_DEG = (-90.0, 35.0, -40.0, 0.0, 0.0, 0.0)
     DEFAULT_TARGET_RELATIVE_OFFSET_CM = (0.0, 0.0, 0.0)
     DEFAULT_TARGET_RELATIVE_RPY_DEG = (90.0, 0.0, 90.0)
+    DEFAULT_POST_GRIPPER_MOVEJ_OFFSET_CM = (0.0, 0.0, 0.0)
+    DEFAULT_POST_GRIPPER_MOVEJ_RPY_OFFSET_DEG = (0.0, 0.0, 0.0)
+    DEFAULT_POST_GRIPPER_MOVEJ_DURATION_S = 2.0
     DEFAULT_FINAL_JOINTS_DEG = (-119.64, 67.09, 67.22, 2.23, 51.75, -14.65)
     DEFAULT_TURN_DURATION_S = 6.0
     DEFAULT_DEBUG_MOVE_DURATION_S = 3.0
@@ -758,7 +761,7 @@ class RealSensePointPanel(QWidget):
             [
                 tr("pc.workflow_next"),
                 "开始执行",
-                    "确认执行第 11 步",
+                "确认执行第 12 步",
                 "流程完成，点击重置",
             ],
         )
@@ -1107,33 +1110,59 @@ class RealSensePointPanel(QWidget):
         gripper_gain_row.addStretch()
         step8_layout.addLayout(gripper_gain_row, 1, 1, 1, 2)
 
-        step9, step9_layout = self._create_step_group("步骤 9 回到调试位")
+        step9, step9_layout = self._create_step_group("步骤 9 当前位姿偏移 IK + MoveJ")
         layout.addWidget(step9, base_row + 5, 0, 1, 5)
+        self.post_gripper_movej_xyz_spins = []
+        for value in self.DEFAULT_POST_GRIPPER_MOVEJ_OFFSET_CM:
+            spin = self._make_float_spin(-50.0, 50.0, value, 0.5, " cm")
+            self.post_gripper_movej_xyz_spins.append(spin)
+        self._add_row_spins(step9_layout, 0, "偏移 XYZ:", self.post_gripper_movej_xyz_spins)
+        self.post_gripper_movej_rpy_spins = []
+        for value in self.DEFAULT_POST_GRIPPER_MOVEJ_RPY_OFFSET_DEG:
+            spin = self._make_float_spin(-180.0, 180.0, value, 1.0, "°")
+            self.post_gripper_movej_rpy_spins.append(spin)
+        self._add_row_spins(step9_layout, 1, "偏移 Rx/Ry/Rz:", self.post_gripper_movej_rpy_spins)
+        self.post_gripper_movej_duration_spin = self._make_float_spin(
+            0.5,
+            30.0,
+            self.DEFAULT_POST_GRIPPER_MOVEJ_DURATION_S,
+            0.5,
+            " s",
+        )
+        self._add_compact_value_row(
+            step9_layout,
+            2,
+            "MoveJ 时间:",
+            self.post_gripper_movej_duration_spin,
+        )
+
+        step10, step10_layout = self._create_step_group("步骤 10 回到调试位")
+        layout.addWidget(step10, base_row + 6, 0, 1, 5)
         self.debug_joint_spins = []
         for value in self.DEFAULT_DEBUG_JOINTS_DEG:
             spin = self._make_float_spin(-360.0, 360.0, value, 1.0, "°")
             self.debug_joint_spins.append(spin)
-        self._add_indexed_joint_spins(step9_layout, 0, "目标关节:", self.debug_joint_spins)
+        self._add_indexed_joint_spins(step10_layout, 0, "目标关节:", self.debug_joint_spins)
         self.flow_debug_duration_spin = self._make_float_spin(3.0, 20.0, self.DEFAULT_DEBUG_MOVE_DURATION_S, 0.5, " s")
-        self._add_compact_value_row(step9_layout, 2, "MoveJ 时间:", self.flow_debug_duration_spin)
+        self._add_compact_value_row(step10_layout, 2, "MoveJ 时间:", self.flow_debug_duration_spin)
 
-        step10, step10_layout = self._create_step_group("步骤 10 慢速转身到 -90°")
-        layout.addWidget(step10, base_row + 6, 0, 1, 5)
+        step11, step11_layout = self._create_step_group("步骤 11 慢速转身到 -90°")
+        layout.addWidget(step11, base_row + 7, 0, 1, 5)
         self.turn_stage1_joint_spins = []
         for value in self.DEFAULT_TURN_STAGE1_JOINTS_DEG:
             spin = self._make_float_spin(-360.0, 360.0, value, 1.0, "°")
             self.turn_stage1_joint_spins.append(spin)
-        self._add_indexed_joint_spins(step10_layout, 0, "目标关节:", self.turn_stage1_joint_spins)
+        self._add_indexed_joint_spins(step11_layout, 0, "目标关节:", self.turn_stage1_joint_spins)
         self.flow_turn_duration_spin = self._make_float_spin(3.0, 20.0, self.DEFAULT_TURN_DURATION_S, 0.5, " s")
-        self._add_compact_value_row(step10_layout, 2, "转身时间:", self.flow_turn_duration_spin)
+        self._add_compact_value_row(step11_layout, 2, "转身时间:", self.flow_turn_duration_spin)
 
-        step11, step11_layout = self._create_step_group("步骤 11 MoveJ 到最终放置构型")
-        layout.addWidget(step11, base_row + 7, 0, 1, 5)
+        step12, step12_layout = self._create_step_group("步骤 12 MoveJ 到最终放置构型")
+        layout.addWidget(step12, base_row + 8, 0, 1, 5)
         self.final_joint_spins = []
         for value in self.DEFAULT_FINAL_JOINTS_DEG:
             spin = self._make_float_spin(-360.0, 360.0, value, 1.0, "°")
             self.final_joint_spins.append(spin)
-        self._add_indexed_joint_spins(step11_layout, 0, "目标关节:", self.final_joint_spins)
+        self._add_indexed_joint_spins(step12_layout, 0, "目标关节:", self.final_joint_spins)
         self.flow_final_duration_spin = self._make_float_spin(
             3.0,
             30.0,
@@ -1141,9 +1170,9 @@ class RealSensePointPanel(QWidget):
             0.5,
             " s",
         )
-        self._add_compact_value_row(step11_layout, 2, "MoveJ 时间:", self.flow_final_duration_spin)
+        self._add_compact_value_row(step12_layout, 2, "MoveJ 时间:", self.flow_final_duration_spin)
 
-        return base_row + 8
+        return base_row + 9
 
     def _populate_putback_controls(self, layout: QGridLayout, row: int) -> int:
         base_row = row
@@ -1601,6 +1630,18 @@ class RealSensePointPanel(QWidget):
             add("gripper_effort", getattr(self, "gripper_effort_spin", None))
             add("gripper_kp", getattr(self, "gripper_kp_spin", None))
             add("gripper_kd", getattr(self, "gripper_kd_spin", None))
+            add_many(
+                "post_gripper_movej_xyz",
+                getattr(self, "post_gripper_movej_xyz_spins", []),
+            )
+            add_many(
+                "post_gripper_movej_rpy",
+                getattr(self, "post_gripper_movej_rpy_spins", []),
+            )
+            add(
+                "post_gripper_movej_duration",
+                getattr(self, "post_gripper_movej_duration_spin", None),
+            )
             add_many("debug_joint", getattr(self, "debug_joint_spins", []))
             add("flow_debug_duration", getattr(self, "flow_debug_duration_spin", None))
             add_many("turn_stage1_joint", getattr(self, "turn_stage1_joint_spins", []))
@@ -2549,6 +2590,7 @@ class RealSensePointPanel(QWidget):
             "杆电机到夹取位",
             "微调抓取位姿",
             "夹爪带监测持续关闭",
+            "当前位姿偏移 IK + MoveJ",
             "机械臂 MoveJ 回到调试位置",
             "机械臂慢速转身到 -90 度构型",
             "机械臂 MoveJ 到最终放置构型",
@@ -2632,10 +2674,12 @@ class RealSensePointPanel(QWidget):
         elif step == 7:
             self._start_monitored_gripper_close()
         elif step == 8:
-            self._execute_return_debug_step()
+            self._execute_post_gripper_movej_offset_step()
         elif step == 9:
-            self._execute_turn_stage1_step()
+            self._execute_return_debug_step()
         elif step == 10:
+            self._execute_turn_stage1_step()
+        elif step == 11:
             self._execute_final_joint_step()
 
     def _execute_putback_motion_step(self, step: int):
@@ -2776,6 +2820,30 @@ class RealSensePointPanel(QWidget):
             rpy_deg=rpy_deg,
         )
         self._send_blocking_movel(pose, "等待机械臂微调到抓取位姿")
+
+    def _execute_post_gripper_movej_offset_step(self):
+        xyz_offset = self._spin_values(self.post_gripper_movej_xyz_spins)
+        rpy_offset = self._spin_values(self.post_gripper_movej_rpy_spins)
+        pose = self._make_pose_from_current_end_pose(
+            x_offset_cm=xyz_offset[0],
+            y_offset_cm=xyz_offset[1],
+            z_offset_cm=xyz_offset[2],
+            rpy_offset_deg=rpy_offset,
+            prefer_last_flow_pose=True,
+        )
+        if pose is None:
+            self._set_error("暂无末端位姿，无法执行当前位姿偏移 MoveJ")
+            return
+        self._send_blocking_end_pose(
+            pose,
+            (
+                "等待机械臂从当前状态偏移 "
+                f"XYZ=[{xyz_offset[0]:.2f}, {xyz_offset[1]:.2f}, {xyz_offset[2]:.2f}]cm "
+                f"RPY=[{rpy_offset[0]:.2f}, {rpy_offset[1]:.2f}, {rpy_offset[2]:.2f}]° "
+                "并 IK + MoveJ 到目标位姿"
+            ),
+            duration=float(self.post_gripper_movej_duration_spin.value()),
+        )
 
     def _execute_return_debug_step(self):
         joints = self._joint_spins_to_radians(self.debug_joint_spins)
@@ -2933,21 +3001,27 @@ class RealSensePointPanel(QWidget):
             return float(self.flow_movel_duration_spin.value())
         return float(self.DEFAULT_FLOW_MOVEL_DURATION_S)
 
-    def _send_blocking_end_pose(self, pose: list[float], waiting_text: str):
+    def _send_blocking_end_pose(
+        self,
+        pose: list[float],
+        waiting_text: str,
+        duration: Optional[float] = None,
+    ):
         self._record_previous_flow_pose()
         self._flow_waiting_motion = True
         self._flow_waiting_kind = "end_pose"
         self._flow_pending_pose = [float(value) for value in pose]
         self._update_flow_button_state()
         self.flow_status_label.setText(waiting_text)
-        duration = (
-            float(self.flow_ik_duration_spin.value())
-            if hasattr(self, "flow_ik_duration_spin")
-            else float(self.flow_debug_duration_spin.value())
-        )
+        if duration is None:
+            duration = (
+                float(self.flow_ik_duration_spin.value())
+                if hasattr(self, "flow_ik_duration_spin")
+                else float(self.flow_debug_duration_spin.value())
+            )
         self.end_pose_block_requested.emit(
             [float(value) for value in pose],
-            duration,
+            float(duration),
         )
 
     def _record_previous_flow_pose(self):
@@ -3390,6 +3464,7 @@ class RealSensePointPanel(QWidget):
         y_offset_cm: float = 0.0,
         z_offset_cm: float = 0.0,
         rpy_deg: Optional[Sequence[float]] = None,
+        rpy_offset_deg: Optional[Sequence[float]] = None,
         local_axes: bool = False,
         prefer_last_flow_pose: bool = False,
     ) -> Optional[list[float]]:
@@ -3413,6 +3488,10 @@ class RealSensePointPanel(QWidget):
             pose[3] = math.radians(float(rpy_deg[0]))
             pose[4] = math.radians(float(rpy_deg[1]))
             pose[5] = math.radians(float(rpy_deg[2]))
+        elif rpy_offset_deg is not None and len(rpy_offset_deg) >= 3:
+            pose[3] += math.radians(float(rpy_offset_deg[0]))
+            pose[4] += math.radians(float(rpy_offset_deg[1]))
+            pose[5] += math.radians(float(rpy_offset_deg[2]))
         return pose
 
     def cleanup(self):

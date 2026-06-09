@@ -32,6 +32,11 @@ pip install -e ".[dynamics]"
 sudo apt install -y libgl1 libglx-mesa0 libgl1-mesa-dri libxrender1 libxcb-xinerama0 libxcb-cursor0
 pip install -e ".[gui]"
 
+# 如需使用独立杆电机，请安装固定串口别名 /dev/rodmotor
+sudo bash scripts/rodmotor_test/install_rodmotor_udev.sh
+# 重新插拔杆电机后确认别名存在
+ls -l /dev/rodmotor
+
 # 配置 CAN 接口
 sudo bash scripts/setup_can.sh can0 1000000
 
@@ -65,6 +70,8 @@ lingzu-bookarm-debugger
 - **可选**: `pin` (Pinocchio) - 运动学/动力学
 - **视觉**: `pyrealsense2`, `open3d`, `opencv-python` — RealSense RGB-D、点云、书脊识别
 - **MotorStudio GUI**: `pyqt6`, `pyqtgraph`, `pyvista`, `pyvistaqt`, `vtk` — GUI + 3D URDF/点云可视化
+
+独立杆电机通过固定串口别名 `/dev/rodmotor` 连接。安装项目环境时请运行 `sudo bash scripts/rodmotor_test/install_rodmotor_udev.sh` 安装 udev 规则；如果更换 USB 转串口设备后别名没有出现，请根据 `ls -l /dev/serial/by-id/` 中的新设备信息更新 `resources/udev/99-rodmotor.rules`，再重新运行安装脚本并重新插拔设备。
 
 ---
 

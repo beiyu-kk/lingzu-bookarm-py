@@ -114,6 +114,15 @@ pip install -e ".[gui]"       # 含 MotorStudio GUI 支持
 
 基础依赖包含：`numpy`、`pyyaml`、`pyserial`、`pyrealsense2`、`open3d`、`opencv-python`。可选：`pin` 用于 FK/IK/重力补偿；`gui` extra 用于 MotorStudio 的 PyQt6 界面、实时曲线和 PyVista/VTK 3D 显示。
 
+如果使用独立杆电机，请在安装项目环境时同时安装固定串口别名规则。MotorStudio 默认通过 `/dev/rodmotor` 连接杆电机：
+
+```bash
+sudo bash scripts/rodmotor_test/install_rodmotor_udev.sh
+ls -l /dev/rodmotor
+```
+
+更换 USB 转串口设备后，如果 `/dev/rodmotor` 没有出现，请先用 `ls -l /dev/serial/by-id/` 查看新设备信息，并同步修改 `resources/udev/99-rodmotor.rules` 中的 `idVendor`、`idProduct` 或 `serial`，然后重新运行安装脚本并重新插拔设备。
+
 ### 3. 安装 MotorStudio 上位机（可选）
 
 MotorStudio 提供 PyQt6 GUI 界面，内含基于 **PyVista** (VTK) 的 3D URDF 可视化、点云选点、关节拖拽控制、实时监控等功能。
