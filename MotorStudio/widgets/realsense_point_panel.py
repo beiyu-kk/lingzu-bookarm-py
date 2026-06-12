@@ -568,8 +568,9 @@ class RealSensePointPanel(QWidget):
     GRIPPER_CLOSE_STALL_TOLERANCE_DEG = 0.3
     GRIPPER_CLOSE_STALL_S = 0.8
     GRIPPER_CLOSE_MIN_MONITOR_S = 0.8
-    GRIPPER_CLOSE_TIMEOUT_S = 4.0
-    GRIPPER_CLOSE_RESEND_INTERVAL_S = 0.35
+    GRIPPER_CLOSE_TIMEOUT_S = 8.0
+    GRIPPER_CLOSE_STEP_DEG = 3.0
+    GRIPPER_CLOSE_STEP_INTERVAL_S = 0.18
     DEFAULT_PUTBACK_TARGET_RPY_DEG = (90.0, 0.0, 60.0)
     DEFAULT_PUTBACK_INSERT_RPY_DEG = (90.0, 0.0, 90.0)
     DEFAULT_PUTBACK_PREPUSH_X_OFFSET_CM = 10.0
@@ -643,11 +644,14 @@ class RealSensePointPanel(QWidget):
         self._rod_current_angle_deg: Optional[float] = None
         self._rod_target_angle_deg: Optional[float] = None
         self._rod_wait_tolerance_deg = 1.5
+        self._current_gripper_angle_deg: Optional[float] = None
         self._gripper_close_target_deg: Optional[float] = None
+        self._gripper_close_last_cmd_deg: Optional[float] = None
         self._gripper_close_started_at_s = 0.0
         self._gripper_close_last_cmd_s = 0.0
         self._gripper_close_last_angle_deg: Optional[float] = None
         self._gripper_close_stable_since_s: Optional[float] = None
+        self._gripper_close_effort_nm = 0.0
         self._workflow_default_edit_enabled = False
         self._workflow_default_controls: dict[str, QWidget] = {}
         self._workflow_default_edit_snapshot: dict[str, object] = {}
@@ -3065,6 +3069,34 @@ class RealSensePointPanel(QWidget):
             float(self.gripper_kd_spin.value()) if effort > 0.0 and hasattr(self, "gripper_kd_spin") else 0.0,
         )
 
+    @staticmethod
+    def _step_toward_angle(current_deg: float, target_deg: float, step_deg: float) -> float:
+        if math.isclose(current_deg, target_deg, abs_tol=1e-9):
+            return float(target_deg)
+        direction = 1.0 if target_deg > current_deg else -1.0
+        next_deg = current_deg + direction * float(step_deg)
+        if direction > 0.0:
+            return float(min(target_deg, next_deg))
+        return float(max(target_deg, next_deg))
+
+    def _maybe_advance_gripper_close_target(self, now_s: float):
+        target_deg = self._gripper_close_target_deg
+        if target_deg is None:
+            return
+        if now_s - self._gripper_close_last_cmd_s < self.GRIPPER_CLOSE_STEP_INTERVAL_S:
+            return
+        base_deg = self._gripper_close_last_cmd_deg
+        if base_deg is None:
+            base_deg = self._current_gripper_angle_deg
+        if base_deg is None:
+            return
+        next_deg = self._step_toward_angle(base_deg, target_deg, self.GRIPPER_CLOSE_STEP_DEG)
+        if math.isclose(next_deg, base_deg, abs_tol=1e-9):
+            return
+        self._send_gripper(next_deg, self._gripper_close_effort_nm)
+        self._gripper_close_last_cmd_deg = next_deg
+        self._gripper_close_last_cmd_s = now_s
+
     def _start_monitored_gripper_close(self):
         target_deg = float(self.gripper_close_spin.value())
         effort = float(self.gripper_effort_spin.value())
@@ -3072,25 +3104,39 @@ class RealSensePointPanel(QWidget):
         self._flow_waiting_kind = "gripper_close"
         self._flow_pending_pose = None
         self._gripper_close_target_deg = target_deg
+        self._gripper_close_effort_nm = effort
         self._gripper_close_started_at_s = time.monotonic()
         self._gripper_close_last_cmd_s = 0.0
+        self._gripper_close_last_cmd_deg = None
         self._gripper_close_last_angle_deg = None
         self._gripper_close_stable_since_s = None
         self._update_flow_button_state()
-        self.flow_status_label.setText("等待夹爪持续关闭并监测到位")
-        self._send_gripper(target_deg, effort)
+        self.flow_status_label.setText("等待夹爪缓慢关闭并监测到位")
+        current_deg = self._current_gripper_angle_deg
+        if current_deg is not None:
+            first_target = self._step_toward_angle(
+                current_deg,
+                target_deg,
+                self.GRIPPER_CLOSE_STEP_DEG,
+            )
+        else:
+            first_target = target_deg
+        self._send_gripper(first_target, effort)
+        self._gripper_close_last_cmd_deg = first_target
         self._gripper_close_last_cmd_s = time.monotonic()
 
     def update_joint_feedback(self, joint_states):
+        try:
+            positions = joint_states.to_list(include_gripper=True)
+        except Exception:
+            return
+        if len(positions) >= 7:
+            self._current_gripper_angle_deg = math.degrees(float(positions[6]))
         if (
             self._flow_waiting_kind != "gripper_close"
             or not self._flow_active
             or not self._flow_waiting_motion
         ):
-            return
-        try:
-            positions = joint_states.to_list(include_gripper=True)
-        except Exception:
             return
         if len(positions) < 7:
             return
@@ -3102,14 +3148,12 @@ class RealSensePointPanel(QWidget):
             return
         now = time.monotonic()
         elapsed = now - self._gripper_close_started_at_s
-        if now - self._gripper_close_last_cmd_s >= self.GRIPPER_CLOSE_RESEND_INTERVAL_S:
-            self._send_gripper(target_deg, float(self.gripper_effort_spin.value()))
-            self._gripper_close_last_cmd_s = now
-
         if abs(current_deg - target_deg) <= self.GRIPPER_CLOSE_TOLERANCE_DEG:
             self._clear_gripper_close_monitor()
             self._advance_book_grasp_flow(f"夹爪已关闭到位：{current_deg:.1f}°")
             return
+
+        self._maybe_advance_gripper_close_target(now)
 
         last_angle = self._gripper_close_last_angle_deg
         if last_angle is not None and abs(current_deg - last_angle) <= self.GRIPPER_CLOSE_STALL_TOLERANCE_DEG:
@@ -3136,10 +3180,12 @@ class RealSensePointPanel(QWidget):
 
     def _clear_gripper_close_monitor(self):
         self._gripper_close_target_deg = None
+        self._gripper_close_last_cmd_deg = None
         self._gripper_close_started_at_s = 0.0
         self._gripper_close_last_cmd_s = 0.0
         self._gripper_close_last_angle_deg = None
         self._gripper_close_stable_since_s = None
+        self._gripper_close_effort_nm = 0.0
 
     def _ensure_rod_connected(self):
         if self._rod_connected:

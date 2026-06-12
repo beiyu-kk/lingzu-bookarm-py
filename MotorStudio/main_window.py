@@ -569,6 +569,7 @@ class MainWindow(QMainWindow):
         positions = joint_states.to_list(include_gripper=False)
         self.teaching_panel.calibration_panel.feed_positions(positions)
         self.book_takeout_panel.update_joint_feedback(joint_states)
+        self.book_putback_panel.update_joint_feedback(joint_states)
 
         now = time.monotonic()
         if now - self._last_ui_update_time < self.UI_UPDATE_INTERVAL_S:
