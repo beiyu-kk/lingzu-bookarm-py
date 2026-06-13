@@ -548,6 +548,15 @@ class ELA3Interface:
                 positions[i] = (fb.position - offset) * direction
         return positions
 
+    def _read_gripper_feedback_position(self) -> Optional[float]:
+        """读取夹爪反馈位置（URDF/关节坐标系，rad）。"""
+        fb = self._driver.get_feedback(self.NUM_JOINTS)
+        if not fb or not fb.is_valid:
+            return None
+        direction = self._joint_directions.get(self.NUM_JOINTS, 1.0)
+        offset = self._joint_offsets.get(self.NUM_JOINTS, 0.0)
+        return (fb.position - offset) * direction
+
     def _sync_command_targets_from_feedback(self, retries: int = 5, delay_s: float = 0.02) -> List[float]:
         """将控制缓存重同步到最新反馈，避免旧目标在设零后继续生效。"""
         feedback = None
@@ -888,6 +897,9 @@ class ELA3Interface:
             self._gripper_motion_mode = True
 
         if self._control_running:
+            with self._state_lock:
+                if self._state == ArmState.ENABLED:
+                    self._state = ArmState.RUNNING
             with self._cmd_lock:
                 self._target_gripper = gripper_angle
                 self._target_gripper_effort = gripper_effort
@@ -904,6 +916,140 @@ class ELA3Interface:
             kd if kd is not None else self._position_kd,
             gripper_effort,
         )
+
+    def GripperCloseWithMonitor(
+        self,
+        target_angle: float,
+        close_speed: float,
+        gripper_effort: float,
+        kp: Optional[float] = None,
+        kd: Optional[float] = None,
+        timeout_s: float = 8.0,
+        monitor_period_s: float = 0.05,
+        target_tolerance: float = 0.035,
+        stall_tolerance: float = 0.005,
+        stall_time_s: float = 0.45,
+        min_monitor_s: float = 0.35,
+        hold_margin: float = 0.009,
+        command_lead_s: float = 0.25,
+    ) -> Dict[str, float | str | bool]:
+        """
+        带反馈监测的持续闭合抓取。
+
+        按 close_speed 逐步推进夹爪目标；若 7 号电机反馈在闭合方向上
+        连续一段时间几乎没有进展，则认为出现夹持/卡滞趋势，并把最终
+        保持角度锁定在当前反馈附近，避免继续硬顶 target_angle。
+        """
+        if not self._connected:
+            logger.error("未连接")
+            return {"ok": False, "reason": "not_connected"}
+
+        close_speed = abs(float(close_speed))
+        if close_speed <= 1e-6:
+            return {"ok": False, "reason": "invalid_speed"}
+
+        target_angle = float(target_angle)
+        effort = float(gripper_effort)
+        timeout_s = max(float(timeout_s), float(monitor_period_s))
+        monitor_period_s = max(0.01, float(monitor_period_s))
+        target_tolerance = abs(float(target_tolerance))
+        stall_tolerance = abs(float(stall_tolerance))
+        stall_time_s = max(0.05, float(stall_time_s))
+        min_monitor_s = max(0.0, float(min_monitor_s))
+        hold_margin = max(0.0, float(hold_margin))
+        command_lead_s = max(0.0, float(command_lead_s))
+
+        start_angle = self._read_gripper_feedback_position()
+        if start_angle is None:
+            start_angle = self._target_gripper
+
+        direction = 1.0 if target_angle >= start_angle else -1.0
+        command_angle = float(start_angle)
+        last_feedback = float(start_angle)
+        last_progress_angle = float(start_angle)
+        stalled_since = None
+        reason = "timeout"
+        start_time = time.monotonic()
+        last_cmd_time = start_time
+
+        with self._state_lock:
+            if self._state == ArmState.ENABLED:
+                self._state = ArmState.RUNNING
+
+        while True:
+            now = time.monotonic()
+            elapsed = now - start_time
+            feedback = self._read_gripper_feedback_position()
+            if feedback is not None:
+                last_feedback = float(feedback)
+
+            remaining = direction * (target_angle - last_feedback)
+            if remaining <= target_tolerance:
+                command_angle = target_angle
+                reason = "target_reached"
+                break
+
+            progress = direction * (last_feedback - last_progress_angle)
+            if progress > stall_tolerance:
+                last_progress_angle = last_feedback
+                stalled_since = None
+            elif elapsed >= min_monitor_s:
+                if stalled_since is None:
+                    stalled_since = now
+                elif now - stalled_since >= stall_time_s:
+                    lock_step = min(hold_margin, max(0.0, remaining))
+                    command_angle = last_feedback + direction * lock_step
+                    reason = "stalled"
+                    break
+
+            if elapsed >= timeout_s:
+                lock_step = min(hold_margin, max(0.0, remaining))
+                command_angle = last_feedback + direction * lock_step
+                reason = "timeout"
+                break
+
+            dt = max(0.0, now - last_cmd_time)
+            last_cmd_time = now
+            desired = command_angle + direction * close_speed * dt
+            if direction > 0.0:
+                desired = min(desired, target_angle)
+                lead_limit = last_feedback + close_speed * command_lead_s + hold_margin
+                command_angle = min(desired, lead_limit)
+            else:
+                desired = max(desired, target_angle)
+                lead_limit = last_feedback - close_speed * command_lead_s - hold_margin
+                command_angle = max(desired, lead_limit)
+
+            if not self.GripperCtrl(
+                command_angle,
+                gripper_effort=effort,
+                kp=kp,
+                kd=kd,
+            ):
+                return {
+                    "ok": False,
+                    "reason": "command_failed",
+                    "final_angle": last_feedback,
+                    "command_angle": command_angle,
+                    "target_angle": target_angle,
+                    "elapsed": elapsed,
+                }
+            time.sleep(monitor_period_s)
+
+        self.GripperCtrl(
+            command_angle,
+            gripper_effort=effort,
+            kp=kp,
+            kd=kd,
+        )
+        return {
+            "ok": True,
+            "reason": reason,
+            "final_angle": last_feedback,
+            "command_angle": command_angle,
+            "target_angle": target_angle,
+            "elapsed": time.monotonic() - start_time,
+        }
 
     # ================================================================
     # 零力矩模式

@@ -277,11 +277,18 @@ def _format_vec_cm(values: Sequence[float]) -> str:
     return f"X={vals[0]:.2f} cm, Y={vals[1]:.2f} cm, Z={vals[2]:.2f} cm"
 
 
-def _book_pick_point_from_polygon(polygon: np.ndarray) -> tuple[int, int]:
+def _book_pick_point_from_polygon(
+    polygon: np.ndarray,
+    workflow_mode: str = "takeout",
+) -> tuple[int, int]:
     points = np.asarray(polygon, dtype=float).reshape(-1, 2)
     if len(points) < 4:
         raise ValueError("书脊识别结果缺少四边形角点。")
     tl, tr, br, bl = points[:4]
+    if str(workflow_mode).lower() in {"putback", "return", "put_back"}:
+        point = tr * 0.25 + br * 0.75
+        return int(round(float(point[0]))), int(round(float(point[1])))
+
     left = tl * (5.0 / 6.0) + bl * (1.0 / 6.0)
     right = tr * (5.0 / 6.0) + br * (1.0 / 6.0)
     point = (left + right) * 0.5
@@ -562,6 +569,7 @@ class RealSensePointPanel(QWidget):
     DEFAULT_GRIPPER_HOLD_EFFORT_NM = 0.12
     DEFAULT_GRIPPER_KP = 18.0
     DEFAULT_GRIPPER_KD = 2.0
+    DEFAULT_GRIPPER_CLOSE_SPEED_DEG_S = 16.7
     DEFAULT_GRASP_RPY_DEG = (75.0, 0.0, 90.0)
     DEFAULT_FLOW_MOVEL_DURATION_S = 2.0
     GRIPPER_CLOSE_TOLERANCE_DEG = 2.0
@@ -602,6 +610,7 @@ class RealSensePointPanel(QWidget):
     move_j_block_requested = pyqtSignal(list, float)
     end_pose_block_requested = pyqtSignal(list, float)
     gripper_requested = pyqtSignal(float, float, float, float)
+    gripper_close_monitor_requested = pyqtSignal(object)
     rod_connect_requested = pyqtSignal(str, int, float)
     rod_write_requested = pyqtSignal(float, int, int, float)
     log_message = pyqtSignal(str)
@@ -955,12 +964,12 @@ class RealSensePointPanel(QWidget):
 
         row = 0
         if self._workflow_mode == "takeout":
-            step1, step1_layout = self._create_step_group("步骤 1 采集点云")
+            step1, step1_layout = self._create_step_group("步骤1：采集点云")
             layout.addWidget(step1, row, 0, 1, 5)
             step1_layout.addWidget(QLabel("点云采集由顶部流程按钮触发"), 0, 0, 1, 5)
 
             row += 1
-            step2, step2_layout = self._create_step_group("步骤 2 识别书籍")
+            step2, step2_layout = self._create_step_group("步骤2：识别书籍")
             layout.addWidget(step2, row, 0, 1, 5)
             template_row = QHBoxLayout()
             template_row.setContentsMargins(0, 0, 0, 0)
@@ -978,7 +987,7 @@ class RealSensePointPanel(QWidget):
             step2_layout.addLayout(template_row, 0, 0, 1, 5)
 
             row += 1
-            step3, step3_layout = self._create_step_group("步骤 3 解算目标点")
+            step3, step3_layout = self._create_step_group("步骤3：解算目标点")
             layout.addWidget(step3, row, 0, 1, 5)
             self.book_status_label = QLabel(tr("pc.book_ready"))
             self.book_status_label.setWordWrap(True)
@@ -988,7 +997,7 @@ class RealSensePointPanel(QWidget):
             self.flow_target_label.setWordWrap(True)
             self._stabilize_flow_label(self.flow_target_label)
             step3_layout.addWidget(self.flow_target_label, 1, 0, 1, 5)
-            step3_layout.addWidget(QLabel("目标点补偿 XYZ:"), 2, 0)
+            step3_layout.addWidget(QLabel("目标点补偿XYZ:"), 2, 0)
             comp_row = QHBoxLayout()
             comp_row.setContentsMargins(0, 0, 0, 0)
             comp_row.setSpacing(4)
@@ -1021,33 +1030,33 @@ class RealSensePointPanel(QWidget):
 
     def _populate_takeout_controls(self, layout: QGridLayout, row: int) -> int:
         base_row = row
-        group, group_layout = self._create_step_group("步骤 4 到达预备抓取位姿")
+        group, group_layout = self._create_step_group("步骤4：到达预备抓取位姿")
         layout.addWidget(group, base_row, 0, 1, 5)
         self.pregrasp_offset_xyz_spins = []
         for value in self.DEFAULT_PREGRASP_OFFSET_CM:
             spin = self._make_float_spin(-50.0, 50.0, value, 0.5, " cm")
             self.pregrasp_offset_xyz_spins.append(spin)
-        self._add_row_spins(group_layout, 0, "预备偏移 XYZ:", self.pregrasp_offset_xyz_spins)
+        self._add_row_spins(group_layout, 0, "预备偏移XYZ:", self.pregrasp_offset_xyz_spins)
 
         self.pregrasp_rpy_spins = []
         for value in self.DEFAULT_GRASP_RPY_DEG:
             spin = self._make_float_spin(-180.0, 180.0, value, 1.0, "°")
             self.pregrasp_rpy_spins.append(spin)
         self.grasp_rpy_spins = self.pregrasp_rpy_spins
-        self._add_row_spins(group_layout, 1, "预备姿态 Rx/Ry/Rz:", self.pregrasp_rpy_spins)
+        self._add_row_spins(group_layout, 1, "预备姿态Rx/Ry/Rz:", self.pregrasp_rpy_spins)
         self._bind_workflow_target_refresh(self.pregrasp_rpy_spins)
 
         self.flow_ik_duration_spin = self._make_float_spin(0.5, 30.0, 2.0, 0.5, " s")
-        self._add_labelled_spin(group_layout, 2, "MoveJ 时间:", self.flow_ik_duration_spin, 0, 1)
+        self._add_labelled_spin(group_layout, 2, "MoveJ时间:", self.flow_ik_duration_spin, 0, 1)
         self.pregrasp_prepare_tools_check = QCheckBox("打开夹爪，并将杆电机运动到 0°")
         self.pregrasp_prepare_tools_check.setChecked(True)
         group_layout.addWidget(self.pregrasp_prepare_tools_check, 3, 0, 1, 5)
 
-        step5, step5_layout = self._create_step_group("步骤 5 到达抓取位姿")
+        step5, step5_layout = self._create_step_group("步骤5：到达抓取位姿")
         layout.addWidget(step5, base_row + 1, 0, 1, 5)
         step5_layout.addWidget(QLabel("执行后自动记录抓取位姿"), 0, 0, 1, 5)
 
-        step6, step6_layout = self._create_step_group("步骤 6 杆电机到夹取位")
+        step6, step6_layout = self._create_step_group("步骤6：杆电机到夹取位")
         layout.addWidget(step6, base_row + 2, 0, 1, 5)
         step6_layout.addWidget(QLabel("串口:"), 0, 0)
         self.rod_port_edit = QLineEdit(self.DEFAULT_ROD_PORT)
@@ -1064,9 +1073,9 @@ class RealSensePointPanel(QWidget):
         step6_layout.addWidget(self.rod_acc_spin, 1, 3)
         step6_layout.setColumnStretch(4, 1)
 
-        step7, step7_layout = self._create_step_group("步骤 7 微调抓取位姿")
+        step7, step7_layout = self._create_step_group("步骤7：微调抓取位姿")
         layout.addWidget(step7, base_row + 3, 0, 1, 5)
-        step7_layout.addWidget(QLabel("微调 XYZ:"), 0, 0)
+        step7_layout.addWidget(QLabel("微调XYZ:"), 0, 0)
         target_offset_row = QHBoxLayout()
         target_offset_row.setContentsMargins(0, 0, 0, 0)
         target_offset_row.setSpacing(4)
@@ -1077,7 +1086,7 @@ class RealSensePointPanel(QWidget):
             target_offset_row.addWidget(spin)
         target_offset_row.addStretch()
         step7_layout.addLayout(target_offset_row, 0, 1, 1, 4)
-        step7_layout.addWidget(QLabel("微调姿态 Rx/Ry/Rz:"), 1, 0)
+        step7_layout.addWidget(QLabel("微调姿态Rx/Ry/Rz:"), 1, 0)
         target_rpy_row = QHBoxLayout()
         target_rpy_row.setContentsMargins(0, 0, 0, 0)
         target_rpy_row.setSpacing(4)
@@ -1089,7 +1098,7 @@ class RealSensePointPanel(QWidget):
         target_rpy_row.addStretch()
         step7_layout.addLayout(target_rpy_row, 1, 1, 1, 4)
 
-        step8, step8_layout = self._create_step_group("步骤 8 夹爪带监测持续关闭")
+        step8, step8_layout = self._create_step_group("步骤8：夹爪带监测持续关闭")
         layout.addWidget(step8, base_row + 4, 0, 1, 5)
         step8_layout.addWidget(QLabel("开/关/力矩:"), 0, 0)
         gripper_row = QHBoxLayout()
@@ -1098,6 +1107,13 @@ class RealSensePointPanel(QWidget):
         self.gripper_open_spin = self._make_float_spin(-30.0, 140.0, self.DEFAULT_GRIPPER_OPEN_DEG, 1.0, "°")
         self.gripper_close_spin = self._make_float_spin(-30.0, 140.0, self.DEFAULT_GRIPPER_CLOSE_DEG, 1.0, "°")
         self.gripper_effort_spin = self._make_float_spin(0.0, 5.0, self.DEFAULT_GRIPPER_HOLD_EFFORT_NM, 0.01, " Nm")
+        self.gripper_close_speed_spin = self._make_float_spin(
+            1.0,
+            60.0,
+            self.DEFAULT_GRIPPER_CLOSE_SPEED_DEG_S,
+            0.5,
+            "°/s",
+        )
         gripper_row.addWidget(self.gripper_open_spin)
         gripper_row.addWidget(self.gripper_close_spin)
         gripper_row.addWidget(self.gripper_effort_spin)
@@ -1113,19 +1129,25 @@ class RealSensePointPanel(QWidget):
         gripper_gain_row.addWidget(self.gripper_kd_spin)
         gripper_gain_row.addStretch()
         step8_layout.addLayout(gripper_gain_row, 1, 1, 1, 2)
+        self._add_compact_value_row(
+            step8_layout,
+            2,
+            "闭合速度:",
+            self.gripper_close_speed_spin,
+        )
 
-        step9, step9_layout = self._create_step_group("步骤 9 当前位姿偏移 IK + MoveJ")
+        step9, step9_layout = self._create_step_group("步骤9：当前位姿偏移IK+MoveJ")
         layout.addWidget(step9, base_row + 5, 0, 1, 5)
         self.post_gripper_movej_xyz_spins = []
         for value in self.DEFAULT_POST_GRIPPER_MOVEJ_OFFSET_CM:
             spin = self._make_float_spin(-50.0, 50.0, value, 0.5, " cm")
             self.post_gripper_movej_xyz_spins.append(spin)
-        self._add_row_spins(step9_layout, 0, "偏移 XYZ:", self.post_gripper_movej_xyz_spins)
+        self._add_row_spins(step9_layout, 0, "偏移XYZ:", self.post_gripper_movej_xyz_spins)
         self.post_gripper_movej_rpy_spins = []
         for value in self.DEFAULT_POST_GRIPPER_MOVEJ_RPY_OFFSET_DEG:
             spin = self._make_float_spin(-180.0, 180.0, value, 1.0, "°")
             self.post_gripper_movej_rpy_spins.append(spin)
-        self._add_row_spins(step9_layout, 1, "偏移 Rx/Ry/Rz:", self.post_gripper_movej_rpy_spins)
+        self._add_row_spins(step9_layout, 1, "偏移Rx/Ry/Rz:", self.post_gripper_movej_rpy_spins)
         self.post_gripper_movej_duration_spin = self._make_float_spin(
             0.5,
             30.0,
@@ -1136,11 +1158,11 @@ class RealSensePointPanel(QWidget):
         self._add_compact_value_row(
             step9_layout,
             2,
-            "MoveJ 时间:",
+            "MoveJ时间:",
             self.post_gripper_movej_duration_spin,
         )
 
-        step10, step10_layout = self._create_step_group("步骤 10 回到调试位")
+        step10, step10_layout = self._create_step_group("步骤10：回到调试位")
         layout.addWidget(step10, base_row + 6, 0, 1, 5)
         self.debug_joint_spins = []
         for value in self.DEFAULT_DEBUG_JOINTS_DEG:
@@ -1148,9 +1170,9 @@ class RealSensePointPanel(QWidget):
             self.debug_joint_spins.append(spin)
         self._add_indexed_joint_spins(step10_layout, 0, "目标关节:", self.debug_joint_spins)
         self.flow_debug_duration_spin = self._make_float_spin(3.0, 20.0, self.DEFAULT_DEBUG_MOVE_DURATION_S, 0.5, " s")
-        self._add_compact_value_row(step10_layout, 2, "MoveJ 时间:", self.flow_debug_duration_spin)
+        self._add_compact_value_row(step10_layout, 2, "MoveJ时间:", self.flow_debug_duration_spin)
 
-        step11, step11_layout = self._create_step_group("步骤 11 慢速转身到 -90°")
+        step11, step11_layout = self._create_step_group("步骤11：慢速转身到-90°")
         layout.addWidget(step11, base_row + 7, 0, 1, 5)
         self.turn_stage1_joint_spins = []
         for value in self.DEFAULT_TURN_STAGE1_JOINTS_DEG:
@@ -1160,7 +1182,7 @@ class RealSensePointPanel(QWidget):
         self.flow_turn_duration_spin = self._make_float_spin(3.0, 20.0, self.DEFAULT_TURN_DURATION_S, 0.5, " s")
         self._add_compact_value_row(step11_layout, 2, "转身时间:", self.flow_turn_duration_spin)
 
-        step12, step12_layout = self._create_step_group("步骤 12 MoveJ 到最终放置构型")
+        step12, step12_layout = self._create_step_group("步骤12：MoveJ到最终放置构型")
         layout.addWidget(step12, base_row + 8, 0, 1, 5)
         self.final_joint_spins = []
         for value in self.DEFAULT_FINAL_JOINTS_DEG:
@@ -1174,59 +1196,59 @@ class RealSensePointPanel(QWidget):
             0.5,
             " s",
         )
-        self._add_compact_value_row(step12_layout, 2, "MoveJ 时间:", self.flow_final_duration_spin)
+        self._add_compact_value_row(step12_layout, 2, "MoveJ时间:", self.flow_final_duration_spin)
 
         return base_row + 9
 
     def _populate_putback_controls(self, layout: QGridLayout, row: int) -> int:
         base_row = row
-        group, group_layout = self._create_step_group("步骤 1-3 识别与目标确认")
-        layout.addWidget(group, base_row, 0, 1, 5)
-        row = 0
+        step1, step1_layout = self._create_step_group("步骤1：采集点云")
+        layout.addWidget(step1, base_row, 0, 1, 5)
+        step1_layout.addWidget(QLabel("点云采集由顶部流程按钮触发"), 0, 0, 1, 5)
+
+        step2, step2_layout = self._create_step_group("步骤2：识别书籍")
+        layout.addWidget(step2, base_row + 1, 0, 1, 5)
+        self.template_combo.setFixedWidth(150)
+        self._add_left_value_row(step2_layout, 0, "识别模板:", self.template_combo)
+
+        step3, step3_layout = self._create_step_group("步骤3：解算目标点")
+        layout.addWidget(step3, base_row + 2, 0, 1, 5)
         self.book_status_label = QLabel(tr("pc.book_ready"))
         self.book_status_label.setWordWrap(True)
         self._stabilize_flow_label(self.book_status_label)
-        group_layout.addWidget(self.book_status_label, row, 0, 1, 5)
+        step3_layout.addWidget(self.book_status_label, 0, 0, 1, 5)
 
-        row += 1
         self.flow_target_label = QLabel(tr("pc.workflow_target"))
         self.flow_target_label.setWordWrap(True)
         self._stabilize_flow_label(self.flow_target_label)
-        group_layout.addWidget(self.flow_target_label, row, 0, 1, 5)
+        step3_layout.addWidget(self.flow_target_label, 1, 0, 1, 5)
 
-        row += 1
-        group_layout.addWidget(QLabel("目标姿态 Rx/Ry/Rz:"), row, 0)
-        target_rpy_row = QHBoxLayout()
-        target_rpy_row.setContentsMargins(0, 0, 0, 0)
-        target_rpy_row.setSpacing(4)
         self.putback_target_rpy_spins = []
         for value in self.DEFAULT_PUTBACK_TARGET_RPY_DEG:
             spin = self._make_float_spin(-180.0, 180.0, value, 1.0, "°")
             self.putback_target_rpy_spins.append(spin)
-            target_rpy_row.addWidget(spin)
-        target_rpy_row.addStretch()
-        group_layout.addLayout(target_rpy_row, row, 1, 1, 4)
+        self._add_left_spins_row(
+            step3_layout,
+            2,
+            "目标姿态Rx/Ry/Rz:",
+            self.putback_target_rpy_spins,
+        )
         self._bind_workflow_target_refresh(self.putback_target_rpy_spins)
 
-        row += 1
-        group_layout.addWidget(QLabel("目标补偿 XYZ:"), row, 0)
-        compensation_row = QHBoxLayout()
-        compensation_row.setContentsMargins(0, 0, 0, 0)
-        compensation_row.setSpacing(4)
         self.putback_target_comp_xyz_spins = []
         for value in (0.0, 0.0, 0.0):
             spin = self._make_float_spin(-50.0, 50.0, value, 0.5, " cm")
             self.putback_target_comp_xyz_spins.append(spin)
-            compensation_row.addWidget(spin)
-        compensation_row.addStretch()
-        group_layout.addLayout(compensation_row, row, 1, 1, 4)
+        self._add_left_spins_row(
+            step3_layout,
+            3,
+            "目标补偿XYZ:",
+            self.putback_target_comp_xyz_spins,
+        )
         self._bind_workflow_target_refresh(self.putback_target_comp_xyz_spins)
 
-        row += 1
-        group2, group2_layout = self._create_step_group("步骤 3-6 推书参数")
-        layout.addWidget(group2, base_row + 1, 0, 1, 5)
-        row2 = 0
-        group2_layout.addWidget(QLabel("预备推书 X:"), row2, 0)
+        step4, step4_layout = self._create_step_group("步骤4：到达预备推书点")
+        layout.addWidget(step4, base_row + 3, 0, 1, 5)
         self.putback_prepush_x_spin = self._make_float_spin(
             -50.0,
             50.0,
@@ -1234,8 +1256,44 @@ class RealSensePointPanel(QWidget):
             1.0,
             " cm",
         )
-        group2_layout.addWidget(self.putback_prepush_x_spin, row2, 1)
-        group2_layout.addWidget(QLabel("推书 Y+:"), row2, 2)
+        self._add_left_value_row(
+            step4_layout,
+            0,
+            "预备偏移X:",
+            self.putback_prepush_x_spin,
+        )
+        self.flow_ik_duration_spin = self._make_float_spin(
+            0.5,
+            30.0,
+            2.0,
+            0.5,
+            " s",
+        )
+        self._add_left_value_row(
+            step4_layout,
+            1,
+            "IK+MoveJ时间:",
+            self.flow_ik_duration_spin,
+        )
+
+        step5, step5_layout = self._create_step_group("步骤5：MoveL到推书点")
+        layout.addWidget(step5, base_row + 4, 0, 1, 5)
+        self.flow_movel_duration_spin = self._make_float_spin(
+            0.5,
+            30.0,
+            2.0,
+            0.5,
+            " s",
+        )
+        self._add_left_value_row(
+            step5_layout,
+            0,
+            "MoveL时间:",
+            self.flow_movel_duration_spin,
+        )
+
+        step6, step6_layout = self._create_step_group("步骤6：推开书本")
+        layout.addWidget(step6, base_row + 5, 0, 1, 5)
         self.putback_push_y_spin = self._make_float_spin(
             -50.0,
             50.0,
@@ -1243,10 +1301,11 @@ class RealSensePointPanel(QWidget):
             0.5,
             " cm",
         )
-        group2_layout.addWidget(self.putback_push_y_spin, row2, 3)
+        self._add_left_value_row(step6_layout, 0, "推书Y+:", self.putback_push_y_spin)
+        self._add_left_value_row(step6_layout, 1, "MoveL时间:", "同步骤5")
 
-        row2 += 1
-        group2_layout.addWidget(QLabel("离开推书 Y+:"), row2, 0)
+        step7, step7_layout = self._create_step_group("步骤7：离开推书位置")
+        layout.addWidget(step7, base_row + 6, 0, 1, 5)
         self.putback_leave_push_y_spin = self._make_float_spin(
             -50.0,
             50.0,
@@ -1254,29 +1313,28 @@ class RealSensePointPanel(QWidget):
             0.5,
             " cm",
         )
-        group2_layout.addWidget(self.putback_leave_push_y_spin, row2, 1)
+        self._add_left_value_row(
+            step7_layout,
+            0,
+            "离开推书Y+:",
+            self.putback_leave_push_y_spin,
+        )
+        self._add_left_value_row(step7_layout, 1, "MoveL时间:", "同步骤5")
 
-        row2 += 1
-        group3, group3_layout = self._create_step_group("步骤 7-10 插入与离开参数")
-        layout.addWidget(group3, base_row + 2, 0, 1, 5)
-        row3 = 0
-        group3_layout.addWidget(QLabel("插入姿态 Rx/Ry/Rz:"), row3, 0)
-        insert_rpy_row = QHBoxLayout()
-        insert_rpy_row.setContentsMargins(0, 0, 0, 0)
-        insert_rpy_row.setSpacing(4)
+        step8, step8_layout = self._create_step_group("步骤8：到达插入预备位")
+        layout.addWidget(step8, base_row + 7, 0, 1, 5)
         self.putback_insert_rpy_spins = []
         for value in self.DEFAULT_PUTBACK_INSERT_RPY_DEG:
             spin = self._make_float_spin(-180.0, 180.0, value, 1.0, "°")
             self.putback_insert_rpy_spins.append(spin)
-            insert_rpy_row.addWidget(spin)
-        insert_rpy_row.addStretch()
-        group3_layout.addLayout(insert_rpy_row, row3, 1, 1, 4)
+        self._add_left_spins_row(
+            step8_layout,
+            0,
+            "插入姿态Rx/Ry/Rz:",
+            self.putback_insert_rpy_spins,
+        )
 
-        row3 += 1
-        group3_layout.addWidget(QLabel("插入预备 XY:"), row3, 0)
-        insert_prepose_row = QHBoxLayout()
-        insert_prepose_row.setContentsMargins(0, 0, 0, 0)
-        insert_prepose_row.setSpacing(4)
+        self.putback_insert_prepose_spins = []
         self.putback_insert_prepose_x_spin = self._make_float_spin(
             -50.0,
             50.0,
@@ -1291,16 +1349,23 @@ class RealSensePointPanel(QWidget):
             0.5,
             " cm",
         )
-        insert_prepose_row.addWidget(self.putback_insert_prepose_x_spin)
-        insert_prepose_row.addWidget(self.putback_insert_prepose_y_spin)
-        insert_prepose_row.addStretch()
-        group3_layout.addLayout(insert_prepose_row, row3, 1, 1, 4)
+        self.putback_insert_prepose_spins.extend(
+            [
+                self.putback_insert_prepose_x_spin,
+                self.putback_insert_prepose_y_spin,
+            ]
+        )
+        self._add_left_spins_row(
+            step8_layout,
+            1,
+            "插入预备XY:",
+            self.putback_insert_prepose_spins,
+        )
+        self._add_left_value_row(step8_layout, 2, "IK+MoveJ时间:", "同步骤4")
 
-        row3 += 1
-        group3_layout.addWidget(QLabel("插入位 XY:"), row3, 0)
-        insert_row = QHBoxLayout()
-        insert_row.setContentsMargins(0, 0, 0, 0)
-        insert_row.setSpacing(4)
+        step9, step9_layout = self._create_step_group("步骤9：MoveL到插入位")
+        layout.addWidget(step9, base_row + 8, 0, 1, 5)
+        self.putback_insert_xy_spins = []
         self.putback_insert_x_spin = self._make_float_spin(
             -50.0,
             50.0,
@@ -1315,22 +1380,17 @@ class RealSensePointPanel(QWidget):
             0.5,
             " cm",
         )
-        insert_row.addWidget(self.putback_insert_x_spin)
-        insert_row.addWidget(self.putback_insert_y_spin)
-        insert_row.addStretch()
-        group3_layout.addLayout(insert_row, row3, 1, 1, 4)
-
-        row3 += 1
-        group3_layout.addWidget(QLabel("离开插入 X+:"), row3, 0)
-        self.putback_leave_insert_x_spin = self._make_float_spin(
-            -50.0,
-            50.0,
-            self.DEFAULT_PUTBACK_LEAVE_INSERT_X_OFFSET_CM,
-            0.5,
-            " cm",
+        self.putback_insert_xy_spins.extend(
+            [
+                self.putback_insert_x_spin,
+                self.putback_insert_y_spin,
+            ]
         )
-        group3_layout.addWidget(self.putback_leave_insert_x_spin, row3, 1)
-        group3_layout.addWidget(QLabel("打开夹爪:"), row3, 2)
+        self._add_left_spins_row(step9_layout, 0, "插入位XY:", self.putback_insert_xy_spins)
+        self._add_left_value_row(step9_layout, 1, "MoveL时间:", "同步骤5")
+
+        step10, step10_layout = self._create_step_group("步骤10：打开夹爪")
+        layout.addWidget(step10, base_row + 9, 0, 1, 5)
         self.putback_gripper_open_spin = self._make_float_spin(
             -30.0,
             140.0,
@@ -1338,33 +1398,42 @@ class RealSensePointPanel(QWidget):
             1.0,
             "°",
         )
-        group3_layout.addWidget(self.putback_gripper_open_spin, row3, 3)
-
-        row3 += 1
-        group4, group4_layout = self._create_step_group("时长与回调试位")
-        layout.addWidget(group4, base_row + 3, 0, 1, 5)
-        row4 = 0
-        group4_layout.addWidget(QLabel("MoveL 时间:"), row4, 0)
-        self.flow_movel_duration_spin = self._make_float_spin(
-            0.5,
-            30.0,
-            2.0,
-            0.5,
-            " s",
+        self._add_left_value_row(
+            step10_layout,
+            0,
+            "打开夹爪:",
+            self.putback_gripper_open_spin,
         )
-        group4_layout.addWidget(self.flow_movel_duration_spin, row4, 1)
-        group4_layout.addWidget(QLabel("IK MoveJ 时间:"), row4, 2)
-        self.flow_ik_duration_spin = self._make_float_spin(
-            0.5,
-            30.0,
-            2.0,
-            0.5,
-            " s",
-        )
-        group4_layout.addWidget(self.flow_ik_duration_spin, row4, 3)
 
-        row4 += 1
-        group4_layout.addWidget(QLabel("回调试位时间:"), row4, 0)
+        step11, step11_layout = self._create_step_group("步骤11：离开插入位")
+        layout.addWidget(step11, base_row + 10, 0, 1, 5)
+        self.putback_leave_insert_x_spin = self._make_float_spin(
+            -50.0,
+            50.0,
+            self.DEFAULT_PUTBACK_LEAVE_INSERT_X_OFFSET_CM,
+            0.5,
+            " cm",
+        )
+        self._add_left_value_row(
+            step11_layout,
+            0,
+            "离开插入X+:",
+            self.putback_leave_insert_x_spin,
+        )
+        self._add_left_value_row(step11_layout, 1, "MoveL时间:", "同步骤5")
+
+        step12, step12_layout = self._create_step_group("步骤12：MoveJ回到调试位")
+        layout.addWidget(step12, base_row + 11, 0, 1, 5)
+        self.debug_joint_spins = []
+        for value in self.DEFAULT_DEBUG_JOINTS_DEG:
+            spin = self._make_float_spin(-360.0, 360.0, value, 1.0, "°")
+            self.debug_joint_spins.append(spin)
+        self._add_left_indexed_joint_spins(
+            step12_layout,
+            0,
+            "目标关节:",
+            self.debug_joint_spins,
+        )
         self.flow_debug_duration_spin = self._make_float_spin(
             3.0,
             20.0,
@@ -1372,16 +1441,14 @@ class RealSensePointPanel(QWidget):
             0.5,
             " s",
         )
-        group4_layout.addWidget(self.flow_debug_duration_spin, row4, 1)
+        self._add_left_value_row(
+            step12_layout,
+            3,
+            "MoveJ时间:",
+            self.flow_debug_duration_spin,
+        )
 
-        row4 += 1
-        self.debug_joint_spins = []
-        for value in self.DEFAULT_DEBUG_JOINTS_DEG:
-            spin = self._make_float_spin(-360.0, 360.0, value, 1.0, "°")
-            self.debug_joint_spins.append(spin)
-        self._add_compact_joint_spins(group4_layout, row4, "调试位关节:", self.debug_joint_spins)
-
-        return base_row + 4
+        return base_row + 12
 
     @staticmethod
     def _make_int_spin(lo: int, hi: int, value: int, step: int) -> QSpinBox:
@@ -1583,6 +1650,74 @@ class RealSensePointPanel(QWidget):
         layout.addLayout(value_row, row, 1, 1, 4)
 
     @staticmethod
+    def _add_left_value_row(layout: QGridLayout, row: int, label: str, value):
+        value_row = QHBoxLayout()
+        value_row.setContentsMargins(0, 0, 0, 0)
+        value_row.setSpacing(4)
+        label_widget = QLabel(label)
+        label_widget.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+        value_row.addWidget(label_widget)
+        if isinstance(value, str):
+            value_widget = QLabel(value)
+            value_widget.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+            value_row.addWidget(value_widget)
+        else:
+            value_row.addWidget(value)
+        value_row.addStretch()
+        layout.addLayout(value_row, row, 0, 1, 5)
+
+    @staticmethod
+    def _add_left_spins_row(
+        layout: QGridLayout,
+        row: int,
+        label: str,
+        spins: Sequence[QDoubleSpinBox],
+    ):
+        value_row = QHBoxLayout()
+        value_row.setContentsMargins(0, 0, 0, 0)
+        value_row.setSpacing(4)
+        label_widget = QLabel(label)
+        label_widget.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+        value_row.addWidget(label_widget)
+        for spin in spins:
+            value_row.addWidget(spin)
+        value_row.addStretch()
+        layout.addLayout(value_row, row, 0, 1, 5)
+
+    @staticmethod
+    def _add_left_indexed_joint_spins(
+        layout: QGridLayout,
+        row: int,
+        label: str,
+        spins: Sequence[QDoubleSpinBox],
+    ):
+        label_row = QHBoxLayout()
+        label_row.setContentsMargins(0, 0, 0, 0)
+        label_row.setSpacing(4)
+        label_widget = QLabel(label)
+        label_widget.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+        label_row.addWidget(label_widget)
+        label_row.addStretch()
+        layout.addLayout(label_row, row, 0, 1, 5)
+
+        joint_grid = QGridLayout()
+        joint_grid.setContentsMargins(0, 0, 0, 0)
+        joint_grid.setHorizontalSpacing(8)
+        joint_grid.setVerticalSpacing(4)
+        for idx, spin in enumerate(spins):
+            cell = QHBoxLayout()
+            cell.setContentsMargins(0, 0, 0, 0)
+            cell.setSpacing(3)
+            joint_label = QLabel(f"J{idx + 1}")
+            joint_label.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+            joint_label.setFixedWidth(18)
+            cell.addWidget(joint_label)
+            cell.addWidget(spin)
+            cell.addStretch()
+            joint_grid.addLayout(cell, idx // 3, idx % 3)
+        layout.addLayout(joint_grid, row + 1, 0, 2, 5)
+
+    @staticmethod
     def _add_step_group(
         parent_layout: QGridLayout,
         row: int,
@@ -1632,6 +1767,7 @@ class RealSensePointPanel(QWidget):
             add("gripper_open", getattr(self, "gripper_open_spin", None))
             add("gripper_close", getattr(self, "gripper_close_spin", None))
             add("gripper_effort", getattr(self, "gripper_effort_spin", None))
+            add("gripper_close_speed", getattr(self, "gripper_close_speed_spin", None))
             add("gripper_kp", getattr(self, "gripper_kp_spin", None))
             add("gripper_kd", getattr(self, "gripper_kd_spin", None))
             add_many(
@@ -1931,7 +2067,7 @@ class RealSensePointPanel(QWidget):
         self._display_cloud(point_cloud)
 
         polygon = np.asarray(pick.polygon, dtype=float).reshape(-1, 2)
-        u, v = _book_pick_point_from_polygon(polygon)
+        u, v = _book_pick_point_from_polygon(polygon, self._workflow_mode)
         camera_point = np.asarray(
             self._frame.point_at_pixel(u, v, max_depth_m=self._depth_max_m),
             dtype=float,
@@ -2134,7 +2270,7 @@ class RealSensePointPanel(QWidget):
         image_bgr = self._frame.color_bgr.copy()
         corners = np.asarray(pick.polygon, dtype=np.int32).reshape(-1, 1, 2)
         cv2.polylines(image_bgr, [corners], True, (0, 0, 255), 5, cv2.LINE_AA)
-        u, v = _book_pick_point_from_polygon(pick.polygon)
+        u, v = _book_pick_point_from_polygon(pick.polygon, self._workflow_mode)
         cv2.circle(image_bgr, (int(u), int(v)), 12, (0, 255, 255), -1, cv2.LINE_AA)
         cv2.circle(image_bgr, (int(u), int(v)), 15, (0, 0, 255), 3, cv2.LINE_AA)
 
@@ -3090,12 +3226,22 @@ class RealSensePointPanel(QWidget):
             base_deg = self._current_gripper_angle_deg
         if base_deg is None:
             return
-        next_deg = self._step_toward_angle(base_deg, target_deg, self.GRIPPER_CLOSE_STEP_DEG)
+        step_deg = self._gripper_close_step_deg()
+        next_deg = self._step_toward_angle(base_deg, target_deg, step_deg)
         if math.isclose(next_deg, base_deg, abs_tol=1e-9):
             return
         self._send_gripper(next_deg, self._gripper_close_effort_nm)
         self._gripper_close_last_cmd_deg = next_deg
         self._gripper_close_last_cmd_s = now_s
+
+    def _gripper_close_speed_deg_s(self) -> float:
+        if hasattr(self, "gripper_close_speed_spin"):
+            return max(0.1, float(self.gripper_close_speed_spin.value()))
+        return self.DEFAULT_GRIPPER_CLOSE_SPEED_DEG_S
+
+    def _gripper_close_step_deg(self) -> float:
+        speed_deg_s = self._gripper_close_speed_deg_s()
+        return max(0.1, speed_deg_s * self.GRIPPER_CLOSE_STEP_INTERVAL_S)
 
     def _start_monitored_gripper_close(self):
         target_deg = float(self.gripper_close_spin.value())
@@ -3111,19 +3257,23 @@ class RealSensePointPanel(QWidget):
         self._gripper_close_last_angle_deg = None
         self._gripper_close_stable_since_s = None
         self._update_flow_button_state()
-        self.flow_status_label.setText("等待夹爪缓慢关闭并监测到位")
-        current_deg = self._current_gripper_angle_deg
-        if current_deg is not None:
-            first_target = self._step_toward_angle(
-                current_deg,
-                target_deg,
-                self.GRIPPER_CLOSE_STEP_DEG,
-            )
-        else:
-            first_target = target_deg
-        self._send_gripper(first_target, effort)
-        self._gripper_close_last_cmd_deg = first_target
-        self._gripper_close_last_cmd_s = time.monotonic()
+        self.flow_status_label.setText("等待后台夹爪监测闭合并保护锁定")
+        self.gripper_close_monitor_requested.emit(
+            {
+                "target_angle": math.radians(target_deg),
+                "close_speed": math.radians(self._gripper_close_speed_deg_s()),
+                "effort": effort,
+                "kp": float(self.gripper_kp_spin.value()) if hasattr(self, "gripper_kp_spin") else 0.0,
+                "kd": float(self.gripper_kd_spin.value()) if hasattr(self, "gripper_kd_spin") else 0.0,
+                "timeout_s": float(self.GRIPPER_CLOSE_TIMEOUT_S),
+                "monitor_period_s": 0.05,
+                "target_tolerance": math.radians(self.GRIPPER_CLOSE_TOLERANCE_DEG),
+                "stall_tolerance": math.radians(self.GRIPPER_CLOSE_STALL_TOLERANCE_DEG),
+                "stall_time_s": float(self.GRIPPER_CLOSE_STALL_S),
+                "min_monitor_s": float(self.GRIPPER_CLOSE_MIN_MONITOR_S),
+                "hold_margin": math.radians(0.5),
+            }
+        )
 
     def update_joint_feedback(self, joint_states):
         try:
@@ -3132,15 +3282,27 @@ class RealSensePointPanel(QWidget):
             return
         if len(positions) >= 7:
             self._current_gripper_angle_deg = math.degrees(float(positions[6]))
-        if (
-            self._flow_waiting_kind != "gripper_close"
-            or not self._flow_active
-            or not self._flow_waiting_motion
-        ):
+
+    def notify_gripper_close_done(self, result):
+        if self._flow_waiting_kind != "gripper_close":
             return
-        if len(positions) < 7:
+        if not self._flow_active or not self._flow_waiting_motion:
             return
-        self._monitor_gripper_close(math.degrees(float(positions[6])))
+        result = dict(result or {})
+        reason = str(result.get("reason", "done"))
+        final_deg = math.degrees(float(result.get("final_angle", 0.0)))
+        command_deg = math.degrees(float(result.get("command_angle", result.get("final_angle", 0.0))))
+        self._current_gripper_angle_deg = final_deg
+        self._clear_gripper_close_monitor()
+        if reason == "target_reached":
+            message = f"夹爪已关闭到目标附近：{final_deg:.1f}°"
+        elif reason == "stalled":
+            message = f"夹爪检测到夹持/卡滞趋势，已锁定保持角度：{command_deg:.1f}°"
+        elif reason == "timeout":
+            message = f"夹爪监测闭合超时，已锁定保持角度：{command_deg:.1f}°"
+        else:
+            message = f"夹爪监测闭合完成，保持角度：{command_deg:.1f}°"
+        self._advance_book_grasp_flow(message)
 
     def _monitor_gripper_close(self, current_deg: float):
         target_deg = self._gripper_close_target_deg

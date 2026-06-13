@@ -442,6 +442,9 @@ class MainWindow(QMainWindow):
                 "gripper_ctrl", angle, effort, kp, kd
             )
         )
+        panel.gripper_close_monitor_requested.connect(
+            lambda params: self.worker.submit_command("gripper_close_monitor", **params)
+        )
         panel.rod_connect_requested.connect(
             lambda port, baud, timeout: self.rodmotor_worker.submit_command(
                 "connect", port, baud, timeout
@@ -455,6 +458,7 @@ class MainWindow(QMainWindow):
         self.worker.move_l_done.connect(panel.notify_move_l_done)
         self.worker.move_j_done.connect(panel.notify_move_j_done)
         self.worker.end_pose_done.connect(panel.notify_end_pose_done)
+        self.worker.gripper_close_done.connect(panel.notify_gripper_close_done)
         self.rodmotor_worker.connected_changed.connect(panel.set_rod_connected)
         self.rodmotor_worker.angle_updated.connect(panel.notify_rod_angle_updated)
         self.rodmotor_worker.write_done.connect(panel.notify_rod_write_done)

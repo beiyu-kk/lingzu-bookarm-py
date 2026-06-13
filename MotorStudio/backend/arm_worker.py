@@ -50,6 +50,7 @@ class ArmWorker(QThread):
     move_j_done = pyqtSignal()
     move_l_done = pyqtSignal()
     end_pose_done = pyqtSignal()
+    gripper_close_done = pyqtSignal(object)
     tcp_offset_updated = pyqtSignal(object)
 
     def __init__(self, parent=None):
@@ -154,6 +155,8 @@ class ArmWorker(QThread):
             self._do_zero_torque_gravity(*args, **kwargs)
         elif cmd == "gripper_ctrl":
             self._do_gripper_ctrl(*args)
+        elif cmd == "gripper_close_monitor":
+            self._do_gripper_close_monitor(*args, **kwargs)
         elif cmd == "set_zero_position":
             self._do_set_zero(*args)
         elif cmd == "verify_zero_sta":
@@ -490,6 +493,68 @@ class ArmWorker(QThread):
         if self.arm and self._enabled:
             self._ensure_control_loop()
             self.arm.GripperCtrl(angle, gripper_effort=effort, kp=kp or None, kd=kd or None)
+
+    def _do_gripper_close_monitor(
+        self,
+        target_angle,
+        close_speed,
+        effort=0.0,
+        kp=0.0,
+        kd=0.0,
+        timeout_s=8.0,
+        monitor_period_s=0.05,
+        target_tolerance=0.035,
+        stall_tolerance=0.005,
+        stall_time_s=0.45,
+        min_monitor_s=0.35,
+        hold_margin=0.009,
+    ):
+        if self._sim_mode:
+            self._sim_target[6] = float(target_angle)
+            self.gripper_close_done.emit(
+                {
+                    "ok": True,
+                    "reason": "target_reached",
+                    "final_angle": float(target_angle),
+                    "command_angle": float(target_angle),
+                    "target_angle": float(target_angle),
+                    "elapsed": 0.0,
+                }
+            )
+            return
+        if not self.arm or not self._enabled:
+            self.error_occurred.emit("机械臂未连接或未使能，无法执行夹爪监测闭合")
+            return
+        self._ensure_control_loop()
+        result = self.arm.GripperCloseWithMonitor(
+            float(target_angle),
+            float(close_speed),
+            gripper_effort=float(effort),
+            kp=float(kp) if float(kp) > 0.0 else None,
+            kd=float(kd) if float(kd) > 0.0 else None,
+            timeout_s=float(timeout_s),
+            monitor_period_s=float(monitor_period_s),
+            target_tolerance=float(target_tolerance),
+            stall_tolerance=float(stall_tolerance),
+            stall_time_s=float(stall_time_s),
+            min_monitor_s=float(min_monitor_s),
+            hold_margin=float(hold_margin),
+        )
+        if not result.get("ok", False):
+            self.error_occurred.emit(f"夹爪监测闭合失败: {result.get('reason', 'unknown')}")
+            return
+        reason = str(result.get("reason", "done"))
+        final_angle = math.degrees(float(result.get("final_angle", target_angle)))
+        command_angle = math.degrees(float(result.get("command_angle", target_angle)))
+        if reason == "stalled":
+            self.log_message.emit(
+                f"夹爪检测到夹持/卡滞趋势，锁定保持角度 {command_angle:.1f}°"
+            )
+        elif reason == "target_reached":
+            self.log_message.emit(f"夹爪已闭合到目标附近 {final_angle:.1f}°")
+        elif reason == "timeout":
+            self.log_message.emit(f"夹爪监测闭合超时，锁定保持角度 {command_angle:.1f}°")
+        self.gripper_close_done.emit(result)
 
     def _do_set_zero(self, motor_num=0xFF):
         if self._sim_mode:
