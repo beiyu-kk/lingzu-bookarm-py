@@ -38,6 +38,7 @@ from MotorStudio.utils.i18n import tr
 from MotorStudio.utils.style import SCENE_COLORS
 from MotorStudio.utils.theme_manager import ThemeManager
 from MotorStudio.utils.tcp_offset_store import get_tcp_offset_path
+from el_a3_sdk.protocol import DEFAULT_JOINT_LIMITS
 
 try:
     import cv2
@@ -277,16 +278,31 @@ def _format_vec_cm(values: Sequence[float]) -> str:
     return f"X={vals[0]:.2f} cm, Y={vals[1]:.2f} cm, Z={vals[2]:.2f} cm"
 
 
+def _normalize_book_workflow_mode(workflow_mode: str) -> str:
+    mode = str(workflow_mode).lower()
+    if mode in {"putback", "return", "put_back"}:
+        return "putback"
+    if mode in {"tail_putback", "tail_return", "end_putback", "book_tail_putback"}:
+        return "tail_putback"
+    return "takeout"
+
+
+def _is_putback_workflow_mode(workflow_mode: str) -> bool:
+    return _normalize_book_workflow_mode(workflow_mode) in {"putback", "tail_putback"}
+
+
 def _book_pick_point_from_polygon(
     polygon: np.ndarray,
     workflow_mode: str = "takeout",
+    putback_right_edge_ratio: float = 0.75,
 ) -> tuple[int, int]:
     points = np.asarray(polygon, dtype=float).reshape(-1, 2)
     if len(points) < 4:
         raise ValueError("书脊识别结果缺少四边形角点。")
     tl, tr, br, bl = points[:4]
-    if str(workflow_mode).lower() in {"putback", "return", "put_back"}:
-        point = tr * 0.25 + br * 0.75
+    if _is_putback_workflow_mode(workflow_mode):
+        ratio = max(0.0, min(1.0, float(putback_right_edge_ratio)))
+        point = tr * (1.0 - ratio) + br * ratio
         return int(round(float(point[0]))), int(round(float(point[1])))
 
     left = tl * (5.0 / 6.0) + bl * (1.0 / 6.0)
@@ -600,7 +616,7 @@ class RealSensePointPanel(QWidget):
     DEFAULT_FINAL_JOINTS_DEG = (-119.64, 67.09, 67.22, 2.23, 51.75, -14.65)
     DEFAULT_TURN_DURATION_S = 6.0
     DEFAULT_DEBUG_MOVE_DURATION_S = 3.0
-    HEADER_MOVE_DURATION_S = 2.0
+    HEADER_MOVE_DURATION_S = 2.5
     DEFAULT_FINAL_MOVE_DURATION_S = 8.0
     FLOW_BUTTON_HEIGHT = 26
     FLOW_BUTTON_WIDTH_EXTRA = 22
@@ -618,7 +634,7 @@ class RealSensePointPanel(QWidget):
 
     def __init__(self, parent=None, workflow_mode: str = "takeout"):
         super().__init__(parent)
-        self._workflow_mode = "putback" if str(workflow_mode).lower() in {"putback", "return", "put_back"} else "takeout"
+        self._workflow_mode = _normalize_book_workflow_mode(workflow_mode)
         self._capture_worker: Optional[RealSenseCaptureWorker] = None
         self._detect_worker: Optional[BookSpineDetectWorker] = None
         self._frame = None
@@ -637,6 +653,7 @@ class RealSensePointPanel(QWidget):
         self._target_robot_point_m: Optional[np.ndarray] = None
         self._book_spine_pick: Optional[object] = None
         self._tcp_offset = np.zeros(6, dtype=float)
+        self._header_zero_duration_s = float(self.HEADER_MOVE_DURATION_S)
         self._current_end_pose = None
         self._rpy_initialized = False
         self._arm_enabled = False
@@ -953,11 +970,7 @@ class RealSensePointPanel(QWidget):
         return self.move_group
 
     def _create_book_grasp_group(self):
-        self.grasp_group = QGroupBox(
-            tr("pc.book_putback_group")
-            if self._workflow_mode == "putback"
-            else tr("pc.book_takeout_group")
-        )
+        self.grasp_group = QGroupBox(self._workflow_group_title())
         layout = QGridLayout(self.grasp_group)
         layout.setHorizontalSpacing(8)
         layout.setVerticalSpacing(6)
@@ -1246,6 +1259,20 @@ class RealSensePointPanel(QWidget):
             self.putback_target_comp_xyz_spins,
         )
         self._bind_workflow_target_refresh(self.putback_target_comp_xyz_spins)
+
+        self.putback_pick_ratio_combo = NoWheelComboBox()
+        self.putback_pick_ratio_combo.addItem("右边线下四分之一", "0.75")
+        self.putback_pick_ratio_combo.addItem("右边线二分之一", "0.50")
+        self.putback_pick_ratio_combo.setFixedWidth(150)
+        self.putback_pick_ratio_combo.currentIndexChanged.connect(
+            lambda *_args: self._refresh_book_pick_from_last_detection()
+        )
+        self._add_left_value_row(
+            step3_layout,
+            4,
+            "取点位置:",
+            self.putback_pick_ratio_combo,
+        )
 
         step4, step4_layout = self._create_step_group("步骤4：到达预备推书点")
         layout.addWidget(step4, base_row + 3, 0, 1, 5)
@@ -1789,6 +1816,7 @@ class RealSensePointPanel(QWidget):
             add_many("final_joint", getattr(self, "final_joint_spins", []))
             add("flow_final_duration", getattr(self, "flow_final_duration_spin", None))
         else:
+            add("putback_pick_ratio", getattr(self, "putback_pick_ratio_combo", None))
             add_many("putback_target_rpy", getattr(self, "putback_target_rpy_spins", []))
             add_many("putback_target_comp_xyz", getattr(self, "putback_target_comp_xyz_spins", []))
             add("putback_prepush_x", getattr(self, "putback_prepush_x_spin", None))
@@ -2067,7 +2095,11 @@ class RealSensePointPanel(QWidget):
         self._display_cloud(point_cloud)
 
         polygon = np.asarray(pick.polygon, dtype=float).reshape(-1, 2)
-        u, v = _book_pick_point_from_polygon(polygon, self._workflow_mode)
+        u, v = _book_pick_point_from_polygon(
+            polygon,
+            self._workflow_mode,
+            self._putback_pick_right_edge_ratio(),
+        )
         camera_point = np.asarray(
             self._frame.point_at_pixel(u, v, max_depth_m=self._depth_max_m),
             dtype=float,
@@ -2083,6 +2115,31 @@ class RealSensePointPanel(QWidget):
         self.status_label.setText(tr("pc.book_point_selected"))
         if self._flow_active and self._flow_step_index == 1:
             self._advance_book_grasp_flow("书籍识别完成，目标点已自动选中")
+
+    def _refresh_book_pick_from_last_detection(self):
+        if getattr(self, "_loading_workflow_defaults", False):
+            return
+        if self._book_spine_pick is None or self._frame is None or self._point_cloud is None:
+            return
+        try:
+            polygon = np.asarray(self._book_spine_pick.polygon, dtype=float).reshape(-1, 2)
+            u, v = _book_pick_point_from_polygon(
+                polygon,
+                self._workflow_mode,
+                self._putback_pick_right_edge_ratio(),
+            )
+            camera_point = np.asarray(
+                self._frame.point_at_pixel(u, v, max_depth_m=self._depth_max_m),
+                dtype=float,
+            )
+            robot_point = camera_point_to_robot_target(camera_point)
+            pixels = np.asarray([u, v], dtype=int)
+            raw_index = self._nearest_point_index_from_pixel(pixels)
+            self._show_book_preview(self._book_spine_pick)
+            self._apply_book_pick(raw_index, camera_point, robot_point, pixels, polygon)
+            self.status_label.setText(tr("pc.book_point_selected"))
+        except Exception as exc:
+            self.error_occurred.emit(f"刷新书籍目标点失败: {exc}")
 
     def _on_book_detection_thread_finished(self):
         self.capture_btn.setEnabled(True)
@@ -2270,7 +2327,11 @@ class RealSensePointPanel(QWidget):
         image_bgr = self._frame.color_bgr.copy()
         corners = np.asarray(pick.polygon, dtype=np.int32).reshape(-1, 1, 2)
         cv2.polylines(image_bgr, [corners], True, (0, 0, 255), 5, cv2.LINE_AA)
-        u, v = _book_pick_point_from_polygon(pick.polygon, self._workflow_mode)
+        u, v = _book_pick_point_from_polygon(
+            pick.polygon,
+            self._workflow_mode,
+            self._putback_pick_right_edge_ratio(),
+        )
         cv2.circle(image_bgr, (int(u), int(v)), 12, (0, 255, 255), -1, cv2.LINE_AA)
         cv2.circle(image_bgr, (int(u), int(v)), 15, (0, 0, 255), 3, cv2.LINE_AA)
 
@@ -2664,8 +2725,30 @@ class RealSensePointPanel(QWidget):
     def _spin_values(spins: Sequence[QDoubleSpinBox]) -> list[float]:
         return [float(spin.value()) for spin in spins]
 
+    def _is_putback_workflow(self) -> bool:
+        return _is_putback_workflow_mode(self._workflow_mode)
+
+    def _putback_pick_right_edge_ratio(self) -> float:
+        combo = getattr(self, "putback_pick_ratio_combo", None)
+        if combo is None:
+            return 0.75
+        value = combo.currentData()
+        if value is None:
+            value = combo.currentText()
+        try:
+            return max(0.0, min(1.0, float(value)))
+        except (TypeError, ValueError):
+            return 0.75
+
+    def _workflow_group_title(self) -> str:
+        if self._workflow_mode == "tail_putback":
+            return tr("pc.book_tail_putback_group")
+        if self._workflow_mode == "putback":
+            return tr("pc.book_putback_group")
+        return tr("pc.book_takeout_group")
+
     def _current_workflow_target_rpy_deg(self) -> list[float]:
-        if self._workflow_mode == "putback" and hasattr(self, "putback_target_rpy_spins"):
+        if self._is_putback_workflow() and hasattr(self, "putback_target_rpy_spins"):
             return self._spin_values(self.putback_target_rpy_spins)
         if self._workflow_mode == "takeout" and hasattr(self, "grasp_rpy_spins"):
             return self._spin_values(self.grasp_rpy_spins)
@@ -2703,10 +2786,12 @@ class RealSensePointPanel(QWidget):
         self.log_message.emit(tr("pc.movel_sent"))
 
     def _flow_log_prefix(self) -> str:
+        if self._workflow_mode == "tail_putback":
+            return "书籍末尾放回流程"
         return "书籍放回流程" if self._workflow_mode == "putback" else "书籍取出流程"
 
     def _book_grasp_steps(self) -> list[str]:
-        if self._workflow_mode == "putback":
+        if self._is_putback_workflow():
             return [
                 "点云识别/采集",
                 "书籍识别，自动选中目标点",
@@ -2742,14 +2827,9 @@ class RealSensePointPanel(QWidget):
         )
 
     def _show_flow_steps_dialog(self):
-        title = (
-            tr("pc.book_putback_group")
-            if self._workflow_mode == "putback"
-            else tr("pc.book_takeout_group")
-        )
         QMessageBox.information(
             self,
-            title,
+            self._workflow_group_title(),
             self._format_flow_steps_text(),
         )
 
@@ -2797,7 +2877,7 @@ class RealSensePointPanel(QWidget):
                 self._begin_flow_wait("detect")
         elif step == 2:
             self._solve_book_grasp_target()
-        elif self._workflow_mode == "putback":
+        elif self._is_putback_workflow():
             self._execute_putback_motion_step(step)
         else:
             self._execute_takeout_motion_step(step)
@@ -3024,15 +3104,26 @@ class RealSensePointPanel(QWidget):
         if not self._arm_enabled:
             self._set_error("机械臂未使能，无法归零")
             return
+        joints = self._joint_control_zero_joints_rad()
         self._send_manual_header_movej(
-            [0.0] * len(self.DEFAULT_DEBUG_JOINTS_DEG),
-            self._manual_header_move_duration(),
+            joints,
+            self._manual_header_zero_duration(),
             "zero_move",
-            "等待机械臂 MoveJ 归零 [0.00, 0.00, 0.00, 0.00, 0.00, 0.00]",
+            f"等待机械臂 MoveJ 归零 {self._format_joint_values_rad_as_deg(joints)}",
         )
 
     def _manual_header_move_duration(self) -> float:
         return float(self.HEADER_MOVE_DURATION_S)
+
+    def set_header_zero_duration(self, duration_s: float):
+        try:
+            value = float(duration_s)
+        except (TypeError, ValueError):
+            return
+        self._header_zero_duration_s = max(0.5, min(30.0, value))
+
+    def _manual_header_zero_duration(self) -> float:
+        return float(self._header_zero_duration_s)
 
     def _send_manual_header_movej(
         self,
@@ -3103,8 +3194,21 @@ class RealSensePointPanel(QWidget):
         return [math.radians(float(spin.value())) for spin in spins]
 
     @staticmethod
+    def _joint_control_zero_joints_rad() -> list[float]:
+        joints = []
+        for joint_id in range(1, 7):
+            lo, hi = DEFAULT_JOINT_LIMITS[joint_id]
+            joints.append(0.0 if lo <= 0.0 <= hi else float(lo))
+        return joints
+
+    @staticmethod
     def _format_joint_spins_deg(spins: Sequence[QDoubleSpinBox]) -> str:
         values = [float(spin.value()) for spin in spins]
+        return "[" + ", ".join(f"{value:.2f}" for value in values) + "]"
+
+    @staticmethod
+    def _format_joint_values_rad_as_deg(joints: Sequence[float]) -> str:
+        values = [math.degrees(float(value)) for value in joints]
         return "[" + ", ".join(f"{value:.2f}" for value in values) + "]"
 
     def _make_putback_target_pose(
@@ -3593,11 +3697,7 @@ class RealSensePointPanel(QWidget):
         self.capture_btn.setText(tr("pc.capture"))
         self.book_group.setTitle(tr("pc.book_group"))
         if hasattr(self, "grasp_group"):
-            self.grasp_group.setTitle(
-                tr("pc.book_putback_group")
-                if self._workflow_mode == "putback"
-                else tr("pc.book_takeout_group")
-            )
+            self.grasp_group.setTitle(self._workflow_group_title())
         for idx, (label, path) in enumerate(BOOK_TEMPLATE_OPTIONS):
             if idx < self.template_combo.count():
                 self.template_combo.setItemText(idx, label)

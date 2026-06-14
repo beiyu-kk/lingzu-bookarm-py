@@ -30,15 +30,20 @@ logger = logging.getLogger("MotorStudio")
 
 
 class MultiRowPanelTabs(QWidget):
-    """Compact two-row navigation for the right-side function panels."""
+    """Grouped navigation for the right-side function panels."""
 
     currentChanged = pyqtSignal(int)
+    categoryChanged = pyqtSignal(str)
+    LOW_LEVEL_CATEGORY = "low_level"
+    LIBRARY_CATEGORY = "library"
 
     def __init__(self, parent=None, columns: int = 5):
         super().__init__(parent)
         self._columns = max(1, int(columns))
         self._buttons: list[QPushButton] = []
         self._pages: list[QWidget] = []
+        self._categories: list[str] = []
+        self._active_category = self.LOW_LEVEL_CATEGORY
         self._button_group = QButtonGroup(self)
         self._button_group.setExclusive(True)
 
@@ -56,9 +61,15 @@ class MultiRowPanelTabs(QWidget):
         self._stack = QStackedWidget(self)
         layout.addWidget(self._stack, 1)
 
-    def addTab(self, widget: QWidget, label: str) -> int:
+    def addTab(
+        self,
+        widget: QWidget,
+        label: str,
+        category: str = LOW_LEVEL_CATEGORY,
+    ) -> int:
         index = len(self._pages)
         self._pages.append(widget)
+        self._categories.append(self._normalize_category(category))
         self._stack.addWidget(widget)
 
         button = QPushButton(label, self)
@@ -68,7 +79,7 @@ class MultiRowPanelTabs(QWidget):
         self._buttons.append(button)
         self._button_group.addButton(button, index)
         button.clicked.connect(lambda _checked=False, i=index: self.setCurrentIndex(i))
-        self._place_button(index, button)
+        self._rebuild_nav_layout()
 
         if index == 0:
             button.setChecked(True)
@@ -84,9 +95,17 @@ class MultiRowPanelTabs(QWidget):
     def currentIndex(self) -> int:
         return self._stack.currentIndex()
 
+    def currentCategory(self) -> str:
+        return self._active_category
+
     def setCurrentIndex(self, index: int):
         if index < 0 or index >= len(self._pages):
             return
+        category = self._categories[index]
+        if category != self._active_category:
+            self._active_category = category
+            self._rebuild_nav_layout()
+            self.categoryChanged.emit(category)
         if index == self._stack.currentIndex():
             self._buttons[index].setChecked(True)
             return
@@ -98,10 +117,43 @@ class MultiRowPanelTabs(QWidget):
         if 0 <= index < len(self._buttons):
             self._buttons[index].setText(text)
 
-    def _place_button(self, index: int, button: QPushButton):
-        row = index // self._columns
-        col = index % self._columns
-        self._nav_layout.addWidget(button, row, col)
+    def setCategory(self, category: str):
+        category = self._normalize_category(category)
+        changed = category != self._active_category
+        if changed:
+            self._active_category = category
+            self._rebuild_nav_layout()
+            self.categoryChanged.emit(category)
+        current = self.currentIndex()
+        if current < 0 or self._categories[current] != category:
+            first_index = self._first_index_for_category(category)
+            if first_index >= 0:
+                self.setCurrentIndex(first_index)
+
+    def _normalize_category(self, category: str) -> str:
+        if category == self.LIBRARY_CATEGORY:
+            return self.LIBRARY_CATEGORY
+        return self.LOW_LEVEL_CATEGORY
+
+    def _first_index_for_category(self, category: str) -> int:
+        for index, item_category in enumerate(self._categories):
+            if item_category == category:
+                return index
+        return -1
+
+    def _rebuild_nav_layout(self):
+        while self._nav_layout.count():
+            self._nav_layout.takeAt(0)
+        visible_index = 0
+        for index, button in enumerate(self._buttons):
+            visible = self._categories[index] == self._active_category
+            button.setVisible(visible)
+            if not visible:
+                continue
+            row = visible_index // self._columns
+            col = visible_index % self._columns
+            self._nav_layout.addWidget(button, row, col)
+            visible_index += 1
         for c in range(self._columns):
             self._nav_layout.setColumnStretch(c, 1)
 
@@ -141,6 +193,7 @@ class MainWindow(QMainWindow):
         tm.theme_changed.connect(lambda _: self.tcp_panel.retranslate_ui())
         tm.theme_changed.connect(lambda _: self.book_takeout_panel.apply_theme())
         tm.theme_changed.connect(lambda _: self.book_putback_panel.apply_theme())
+        tm.theme_changed.connect(lambda _: self.book_tail_putback_panel.apply_theme())
 
         QTimer.singleShot(500, self._init_3d_model)
         if self._sim_mode:
@@ -193,14 +246,31 @@ class MainWindow(QMainWindow):
         self.viewer_3d.set_tcp_offset(self.tcp_panel.get_tcp_offset())
 
         self.book_takeout_panel = RealSensePointPanel(workflow_mode="takeout")
-        self.tabs.addTab(self.book_takeout_panel, tr("tab.book_takeout"))
+        self.tabs.addTab(
+            self.book_takeout_panel,
+            tr("tab.book_takeout"),
+            category=MultiRowPanelTabs.LIBRARY_CATEGORY,
+        )
         self.book_takeout_viewer = self.book_takeout_panel.viewer_widget()
         self.left_stack.addWidget(self.book_takeout_viewer)
 
         self.book_putback_panel = RealSensePointPanel(workflow_mode="putback")
-        self.tabs.addTab(self.book_putback_panel, tr("tab.book_putback"))
+        self.tabs.addTab(
+            self.book_putback_panel,
+            tr("tab.book_putback"),
+            category=MultiRowPanelTabs.LIBRARY_CATEGORY,
+        )
         self.book_putback_viewer = self.book_putback_panel.viewer_widget()
         self.left_stack.addWidget(self.book_putback_viewer)
+
+        self.book_tail_putback_panel = RealSensePointPanel(workflow_mode="tail_putback")
+        self.tabs.addTab(
+            self.book_tail_putback_panel,
+            tr("tab.book_tail_putback"),
+            category=MultiRowPanelTabs.LIBRARY_CATEGORY,
+        )
+        self.book_tail_putback_viewer = self.book_tail_putback_panel.viewer_widget()
+        self.left_stack.addWidget(self.book_tail_putback_viewer)
 
         self.teaching_panel = TeachingPanel()
         self.tabs.addTab(self.teaching_panel, tr("tab.teaching"))
@@ -244,7 +314,15 @@ class MainWindow(QMainWindow):
 
         self._book_takeout_tab_index = self.tabs.indexOf(self.book_takeout_panel)
         self._book_putback_tab_index = self.tabs.indexOf(self.book_putback_panel)
+        self._book_tail_putback_tab_index = self.tabs.indexOf(self.book_tail_putback_panel)
+        self._sync_book_header_zero_duration(
+            self.joint_panel.zero_duration_spin.value()
+        )
+        self.toolbar.set_panel_category(self.tabs.currentCategory(), emit=False)
         self.tabs.currentChanged.connect(self._on_tab_changed)
+        self.tabs.categoryChanged.connect(
+            lambda category: self.toolbar.set_panel_category(category, emit=False)
+        )
         self._sync_left_view_for_tab(self.tabs.currentIndex())
         QTimer.singleShot(0, lambda: self._adjust_dock_sizes(self.viewer_dock, self.tabs_dock))
 
@@ -254,6 +332,7 @@ class MainWindow(QMainWindow):
         tb.disconnect_requested.connect(lambda: self.worker.submit_command("disconnect"))
         tb.enable_requested.connect(lambda: self.worker.submit_command("enable"))
         tb.disable_requested.connect(lambda: self.worker.submit_command("disable"))
+        tb.panel_category_requested.connect(self.tabs.setCategory)
         tb.emergency_stop_requested.connect(
             lambda: self.worker.submit_command("emergency_stop")
         )
@@ -265,6 +344,7 @@ class MainWindow(QMainWindow):
         self.worker.enabled_changed.connect(self.viewer_3d.set_enabled)
         self.worker.enabled_changed.connect(self.book_takeout_panel.set_arm_enabled)
         self.worker.enabled_changed.connect(self.book_putback_panel.set_arm_enabled)
+        self.worker.enabled_changed.connect(self.book_tail_putback_panel.set_arm_enabled)
         self.worker.error_occurred.connect(self._on_error)
         self.worker.log_message.connect(self._append_log)
         self.worker.can_fps_updated.connect(tb.set_fps)
@@ -275,6 +355,7 @@ class MainWindow(QMainWindow):
         self.worker.end_pose_updated.connect(self.trajectory_panel.update_current_end_pose)
         self.worker.end_pose_updated.connect(self.book_takeout_panel.update_current_end_pose)
         self.worker.end_pose_updated.connect(self.book_putback_panel.update_current_end_pose)
+        self.worker.end_pose_updated.connect(self.book_tail_putback_panel.update_current_end_pose)
         self.worker.end_pose_updated.connect(self.viewer_3d.update_tcp_point)
         self.worker.tcp_offset_updated.connect(self.tcp_panel.set_tcp_offset)
         self.worker.tcp_offset_updated.connect(self.viewer_3d.set_tcp_offset)
@@ -287,6 +368,9 @@ class MainWindow(QMainWindow):
         )
         self.joint_panel.go_zero_requested.connect(
             lambda pos, dur: self.worker.submit_command("move_j", pos, dur)
+        )
+        self.joint_panel.zero_duration_spin.valueChanged.connect(
+            self._sync_book_header_zero_duration
         )
 
         tp = self.trajectory_panel
@@ -307,12 +391,14 @@ class MainWindow(QMainWindow):
         tcp.tcp_apply_requested.connect(self.viewer_3d.set_tcp_offset)
         tcp.tcp_apply_requested.connect(self.book_takeout_panel.set_tcp_offset)
         tcp.tcp_apply_requested.connect(self.book_putback_panel.set_tcp_offset)
+        tcp.tcp_apply_requested.connect(self.book_tail_putback_panel.set_tcp_offset)
         tcp.tcp_save_requested.connect(
             lambda offset: self.worker.submit_command("save_tcp_offset", offset)
         )
         tcp.tcp_save_requested.connect(self.viewer_3d.set_tcp_offset)
         tcp.tcp_save_requested.connect(self.book_takeout_panel.set_tcp_offset)
         tcp.tcp_save_requested.connect(self.book_putback_panel.set_tcp_offset)
+        tcp.tcp_save_requested.connect(self.book_tail_putback_panel.set_tcp_offset)
         tcp.tcp_restore_requested.connect(
             lambda: self.worker.submit_command("restore_tcp_offset")
         )
@@ -325,11 +411,16 @@ class MainWindow(QMainWindow):
         tcp.tcp_restore_requested.connect(
             lambda: self.book_putback_panel.set_tcp_offset([0.0] * 6)
         )
+        tcp.tcp_restore_requested.connect(
+            lambda: self.book_tail_putback_panel.set_tcp_offset([0.0] * 6)
+        )
         self.worker.tcp_offset_updated.connect(self.book_takeout_panel.set_tcp_offset)
         self.worker.tcp_offset_updated.connect(self.book_putback_panel.set_tcp_offset)
+        self.worker.tcp_offset_updated.connect(self.book_tail_putback_panel.set_tcp_offset)
 
         self._connect_point_workflow_panel(self.book_takeout_panel)
         self._connect_point_workflow_panel(self.book_putback_panel)
+        self._connect_point_workflow_panel(self.book_tail_putback_panel)
 
         teach = self.teaching_panel
         teach.zero_torque_requested.connect(
@@ -482,14 +573,16 @@ class MainWindow(QMainWindow):
         self.tabs.setTabText(2, tr("tab.tcp"))
         self.tabs.setTabText(3, tr("tab.book_takeout"))
         self.tabs.setTabText(4, tr("tab.book_putback"))
-        self.tabs.setTabText(5, tr("tab.teaching"))
-        self.tabs.setTabText(6, tr("tab.diagnostics"))
-        self.tabs.setTabText(7, tr("tab.gripper"))
-        self.tabs.setTabText(8, tr("tab.rodmotor"))
-        self.tabs.setTabText(9, tr("tab.gamepad"))
+        self.tabs.setTabText(5, tr("tab.book_tail_putback"))
+        self.tabs.setTabText(6, tr("tab.teaching"))
+        self.tabs.setTabText(7, tr("tab.diagnostics"))
+        self.tabs.setTabText(8, tr("tab.gripper"))
+        self.tabs.setTabText(9, tr("tab.rodmotor"))
+        self.tabs.setTabText(10, tr("tab.gamepad"))
 
         for panel in (self.toolbar, self.joint_panel, self.trajectory_panel,
                       self.tcp_panel, self.book_takeout_panel, self.book_putback_panel,
+                      self.book_tail_putback_panel,
                       self.teaching_panel, self.diagnostics_panel, self.gripper_panel,
                       self.rodmotor_panel, self.gamepad_panel, self.viewer_3d):
             if hasattr(panel, "retranslate_ui"):
@@ -524,6 +617,14 @@ class MainWindow(QMainWindow):
     def _on_connect(self, can_name: str, connect_kwargs: dict):
         self.worker.submit_command("connect", can_name, **connect_kwargs)
 
+    def _sync_book_header_zero_duration(self, duration_s: float):
+        for panel in (
+            self.book_takeout_panel,
+            self.book_putback_panel,
+            self.book_tail_putback_panel,
+        ):
+            panel.set_header_zero_duration(duration_s)
+
     def _on_tab_changed(self, index: int):
         self._sync_left_view_for_tab(index)
 
@@ -533,6 +634,7 @@ class MainWindow(QMainWindow):
             self.viewer_dock.setWindowTitle(tr("win.point_cloud_viewer"))
             self.book_takeout_panel.show_viewer()
             self.book_putback_panel.hide_viewer()
+            self.book_tail_putback_panel.hide_viewer()
             self._adjust_dock_sizes(
                 self.viewer_dock,
                 self.tabs_dock,
@@ -544,6 +646,19 @@ class MainWindow(QMainWindow):
             self.viewer_dock.setWindowTitle(tr("win.point_cloud_viewer"))
             self.book_putback_panel.show_viewer()
             self.book_takeout_panel.hide_viewer()
+            self.book_tail_putback_panel.hide_viewer()
+            self._adjust_dock_sizes(
+                self.viewer_dock,
+                self.tabs_dock,
+                left_ratio=0.60,
+            )
+            return
+        if index == getattr(self, "_book_tail_putback_tab_index", -1):
+            self.left_stack.setCurrentWidget(self.book_tail_putback_viewer)
+            self.viewer_dock.setWindowTitle(tr("win.point_cloud_viewer"))
+            self.book_tail_putback_panel.show_viewer()
+            self.book_takeout_panel.hide_viewer()
+            self.book_putback_panel.hide_viewer()
             self._adjust_dock_sizes(
                 self.viewer_dock,
                 self.tabs_dock,
@@ -554,6 +669,7 @@ class MainWindow(QMainWindow):
         self.viewer_dock.setWindowTitle(tr("win.viewer"))
         self.book_takeout_panel.hide_viewer()
         self.book_putback_panel.hide_viewer()
+        self.book_tail_putback_panel.hide_viewer()
         self._adjust_dock_sizes(
             self.viewer_dock,
             self.tabs_dock,
@@ -574,6 +690,7 @@ class MainWindow(QMainWindow):
         self.teaching_panel.calibration_panel.feed_positions(positions)
         self.book_takeout_panel.update_joint_feedback(joint_states)
         self.book_putback_panel.update_joint_feedback(joint_states)
+        self.book_tail_putback_panel.update_joint_feedback(joint_states)
 
         now = time.monotonic()
         if now - self._last_ui_update_time < self.UI_UPDATE_INTERVAL_S:
@@ -615,6 +732,7 @@ class MainWindow(QMainWindow):
         self.gamepad_panel.cleanup()
         self.book_takeout_panel.cleanup()
         self.book_putback_panel.cleanup()
+        self.book_tail_putback_panel.cleanup()
         if self.monitoring_window.isVisible():
             self.monitoring_window.close()
         self.worker.stop()

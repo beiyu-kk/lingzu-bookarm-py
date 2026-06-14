@@ -99,6 +99,24 @@ QPushButton#panelTabButton:hover:!checked {{
     color: #cdd6f4;
     background-color: #202238;
 }}
+QPushButton#panelGroupButton {{
+    background-color: #10111f;
+    color: #cdd6f4;
+    border: 1px solid #34364d;
+    border-radius: 9px;
+    padding: 7px 14px;
+    font-weight: 700;
+    min-height: 26px;
+}}
+QPushButton#panelGroupButton:checked {{
+    background-color: #20304f;
+    color: #ffffff;
+    border-color: #89b4fa;
+}}
+QPushButton#panelGroupButton:hover:!checked {{
+    background-color: #1b1d31;
+    border-color: #6b7084;
+}}
 
 /* ── 按钮 ── */
 QPushButton {{
@@ -464,6 +482,24 @@ QPushButton#panelTabButton:checked {{
 QPushButton#panelTabButton:hover:!checked {{
     color: #1d1d2e;
     background-color: #e8eaf2;
+}}
+QPushButton#panelGroupButton {{
+    background-color: #ffffff;
+    color: #2f3446;
+    border: 1px solid #c8cad5;
+    border-radius: 9px;
+    padding: 7px 14px;
+    font-weight: 700;
+    min-height: 26px;
+}}
+QPushButton#panelGroupButton:checked {{
+    background-color: #e8f0ff;
+    color: #1f5fd1;
+    border-color: #3478f6;
+}}
+QPushButton#panelGroupButton:hover:!checked {{
+    background-color: #f4f6fb;
+    border-color: #aeb3c1;
 }}
 
 /* ── 按钮 ── */

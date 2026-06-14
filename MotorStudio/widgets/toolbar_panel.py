@@ -48,11 +48,13 @@ class ToolbarPanel(QWidget):
     disable_requested = pyqtSignal()
     emergency_stop_requested = pyqtSignal()
     open_monitor_requested = pyqtSignal()
+    panel_category_requested = pyqtSignal(str)
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self._connected = False
         self._enabled = False
+        self._panel_category = "low_level"
         self._interfaces = []
         self.setFixedHeight(48)
         self._separators: list[QFrame] = []
@@ -155,8 +157,6 @@ class ToolbarPanel(QWidget):
         self.enable_btn.clicked.connect(self._on_enable_clicked)
         row.addWidget(self.enable_btn)
 
-        self._add_sep(row)
-
         self.estop_btn = QPushButton(tr("tb.estop"))
         self.estop_btn.setObjectName("emergencyStop")
         self.estop_btn.setFixedWidth(60)
@@ -170,6 +170,28 @@ class ToolbarPanel(QWidget):
         self.monitor_btn.setToolTip(tr("tb.monitor_tip"))
         self.monitor_btn.clicked.connect(self.open_monitor_requested.emit)
         row.addWidget(self.monitor_btn)
+
+        row.addSpacing(24)
+
+        self.low_level_btn = QPushButton(tr("panel.low_level"))
+        self.low_level_btn.setCheckable(True)
+        self.low_level_btn.setObjectName("panelGroupButton")
+        self.low_level_btn.setFixedWidth(92)
+        self.low_level_btn.clicked.connect(
+            lambda: self.set_panel_category("low_level", emit=True)
+        )
+        row.addWidget(self.low_level_btn)
+
+        self.library_btn = QPushButton(tr("panel.library"))
+        self.library_btn.setCheckable(True)
+        self.library_btn.setObjectName("panelGroupButton")
+        self.library_btn.setFixedWidth(100)
+        self.library_btn.clicked.connect(
+            lambda: self.set_panel_category("library", emit=True)
+        )
+        row.addWidget(self.library_btn)
+
+        self.set_panel_category(self._panel_category, emit=False)
 
         row.addStretch()
 
@@ -226,6 +248,8 @@ class ToolbarPanel(QWidget):
         self.serial_baud_combo.setToolTip(tr("tb.serial_baud_tip"))
         self.can_baud_combo.setToolTip(tr("tb.can_baud_tip"))
         self.refresh_btn.setToolTip(tr("tb.refresh_tip"))
+        self.low_level_btn.setText(tr("panel.low_level"))
+        self.library_btn.setText(tr("panel.library"))
         self.estop_btn.setText(tr("tb.estop"))
         self.monitor_btn.setText(tr("tb.monitor"))
         self.monitor_btn.setToolTip(tr("tb.monitor_tip"))
@@ -246,6 +270,14 @@ class ToolbarPanel(QWidget):
             self.status_label.setText(tr("tb.not_connected"))
 
         self._update_can_toggle_label()
+
+    def set_panel_category(self, category: str, emit: bool = False):
+        category = "library" if category == "library" else "low_level"
+        self._panel_category = category
+        self.low_level_btn.setChecked(category == "low_level")
+        self.library_btn.setChecked(category == "library")
+        if emit:
+            self.panel_category_requested.emit(category)
 
     # ---- 后端切换 ----
 

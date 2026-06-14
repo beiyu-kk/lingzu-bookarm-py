@@ -17,6 +17,8 @@ _STRINGS: dict[str, dict[str, str]] = {
     "win.model_fail":       {"zh": "3D 模型加载失败（检查 URDF 和 mesh 路径）",
                              "en": "3D model load failed (check URDF & mesh paths)"},
     "win.closing":          {"zh": "正在关闭...",              "en": "Closing..."},
+    "panel.low_level":      {"zh": "底层控制",                 "en": "Low-Level Control"},
+    "panel.library":        {"zh": "图书馆功能",               "en": "Library"},
 
     # ── tabs ──
     "tab.joint":            {"zh": "关节控制",   "en": "Joint Control"},
@@ -28,8 +30,10 @@ _STRINGS: dict[str, dict[str, str]] = {
     "tab.gamepad":          {"zh": "手柄",       "en": "Gamepad"},
     "tab.book_takeout":     {"zh": "书籍取出",   "en": "Book Takeout"},
     "tab.book_putback":     {"zh": "书籍放回",   "en": "Book Putback"},
+    "tab.book_tail_putback": {"zh": "书籍末尾放回", "en": "Book Tail Putback"},
     "pc.book_takeout_group": {"zh": "书籍取出流程", "en": "Book Takeout Workflow"},
     "pc.book_putback_group": {"zh": "书籍放回流程", "en": "Book Putback Workflow"},
+    "pc.book_tail_putback_group": {"zh": "书籍末尾放回流程", "en": "Book Tail Putback Workflow"},
     "pc.workflow_reset":    {"zh": "重置流程",     "en": "Reset Workflow"},
     "pc.workflow_back":     {"zh": "回退到上一步位置", "en": "Rollback One Step"},
     "pc.workflow_detect":   {"zh": "识别书籍",     "en": "Detect Book"},
