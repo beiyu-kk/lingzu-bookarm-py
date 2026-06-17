@@ -932,6 +932,8 @@ class ELA3Interface:
         min_monitor_s: float = 0.35,
         hold_margin: float = 0.009,
         command_lead_s: float = 0.25,
+        start_effort: Optional[float] = None,
+        start_boost_s: float = 0.8,
     ) -> Dict[str, float | str | bool]:
         """
         带反馈监测的持续闭合抓取。
@@ -950,6 +952,7 @@ class ELA3Interface:
 
         target_angle = float(target_angle)
         effort = float(gripper_effort)
+        startup_effort = effort if start_effort is None else max(effort, float(start_effort))
         timeout_s = max(float(timeout_s), float(monitor_period_s))
         monitor_period_s = max(0.01, float(monitor_period_s))
         target_tolerance = abs(float(target_tolerance))
@@ -958,6 +961,12 @@ class ELA3Interface:
         min_monitor_s = max(0.0, float(min_monitor_s))
         hold_margin = max(0.0, float(hold_margin))
         command_lead_s = max(0.0, float(command_lead_s))
+        start_boost_s = max(0.0, float(start_boost_s))
+        stall_lead_threshold = max(
+            stall_tolerance * 3.0,
+            hold_margin * 2.0,
+            close_speed * min(max(command_lead_s, monitor_period_s), 0.25) * 0.5,
+        )
 
         start_angle = self._read_gripper_feedback_position()
         if start_angle is None:
@@ -980,7 +989,8 @@ class ELA3Interface:
             now = time.monotonic()
             elapsed = now - start_time
             feedback = self._read_gripper_feedback_position()
-            if feedback is not None:
+            feedback_valid = feedback is not None
+            if feedback_valid:
                 last_feedback = float(feedback)
 
             remaining = direction * (target_angle - last_feedback)
@@ -989,18 +999,29 @@ class ELA3Interface:
                 reason = "target_reached"
                 break
 
-            progress = direction * (last_feedback - last_progress_angle)
-            if progress > stall_tolerance:
-                last_progress_angle = last_feedback
+            command_feedback_gap = max(0.0, direction * (command_angle - last_feedback))
+            if feedback_valid:
+                progress = direction * (last_feedback - last_progress_angle)
+                if progress > stall_tolerance:
+                    last_progress_angle = last_feedback
+                    stalled_since = None
+                elif (
+                    elapsed >= min_monitor_s
+                    and remaining > target_tolerance
+                    and command_feedback_gap >= stall_lead_threshold
+                ):
+                    if stalled_since is None:
+                        stalled_since = now
+                    elif now - stalled_since >= stall_time_s:
+                        lock_step = min(hold_margin, max(0.0, remaining))
+                        command_angle = last_feedback + direction * lock_step
+                        reason = "stalled"
+                        break
+                else:
+                    stalled_since = None
+            else:
+                # Missing feedback packets should not be counted as a mechanical stall.
                 stalled_since = None
-            elif elapsed >= min_monitor_s:
-                if stalled_since is None:
-                    stalled_since = now
-                elif now - stalled_since >= stall_time_s:
-                    lock_step = min(hold_margin, max(0.0, remaining))
-                    command_angle = last_feedback + direction * lock_step
-                    reason = "stalled"
-                    break
 
             if elapsed >= timeout_s:
                 lock_step = min(hold_margin, max(0.0, remaining))
@@ -1020,9 +1041,10 @@ class ELA3Interface:
                 lead_limit = last_feedback - close_speed * command_lead_s - hold_margin
                 command_angle = max(desired, lead_limit)
 
+            active_effort = startup_effort if elapsed < start_boost_s else effort
             if not self.GripperCtrl(
                 command_angle,
-                gripper_effort=effort,
+                gripper_effort=active_effort,
                 kp=kp,
                 kd=kd,
             ):
@@ -1032,6 +1054,9 @@ class ELA3Interface:
                     "final_angle": last_feedback,
                     "command_angle": command_angle,
                     "target_angle": target_angle,
+                    "command_feedback_gap": max(0.0, direction * (command_angle - last_feedback)),
+                    "stall_lead_threshold": stall_lead_threshold,
+                    "startup_effort": startup_effort,
                     "elapsed": elapsed,
                 }
             time.sleep(monitor_period_s)
@@ -1048,6 +1073,9 @@ class ELA3Interface:
             "final_angle": last_feedback,
             "command_angle": command_angle,
             "target_angle": target_angle,
+            "command_feedback_gap": max(0.0, direction * (command_angle - last_feedback)),
+            "stall_lead_threshold": stall_lead_threshold,
+            "startup_effort": startup_effort,
             "elapsed": time.monotonic() - start_time,
         }
 

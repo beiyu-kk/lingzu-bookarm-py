@@ -508,6 +508,9 @@ class ArmWorker(QThread):
         stall_time_s=0.45,
         min_monitor_s=0.35,
         hold_margin=0.009,
+        command_lead_s=0.25,
+        start_effort=None,
+        start_boost_s=0.8,
     ):
         if self._sim_mode:
             self._sim_target[6] = float(target_angle)
@@ -539,6 +542,9 @@ class ArmWorker(QThread):
             stall_time_s=float(stall_time_s),
             min_monitor_s=float(min_monitor_s),
             hold_margin=float(hold_margin),
+            command_lead_s=float(command_lead_s),
+            start_effort=float(start_effort) if start_effort is not None else None,
+            start_boost_s=float(start_boost_s),
         )
         if not result.get("ok", False):
             self.error_occurred.emit(f"夹爪监测闭合失败: {result.get('reason', 'unknown')}")
@@ -547,8 +553,12 @@ class ArmWorker(QThread):
         final_angle = math.degrees(float(result.get("final_angle", target_angle)))
         command_angle = math.degrees(float(result.get("command_angle", target_angle)))
         if reason == "stalled":
+            gap_deg = math.degrees(float(result.get("command_feedback_gap", 0.0)))
+            threshold_deg = math.degrees(float(result.get("stall_lead_threshold", 0.0)))
+            startup_effort = float(result.get("startup_effort", 0.0))
             self.log_message.emit(
                 f"夹爪检测到夹持/卡滞趋势，锁定保持角度 {command_angle:.1f}°"
+                f"（指令-反馈差 {gap_deg:.1f}°，阈值 {threshold_deg:.1f}°，起步力矩 {startup_effort:.2f}）"
             )
         elif reason == "target_reached":
             self.log_message.emit(f"夹爪已闭合到目标附近 {final_angle:.1f}°")
