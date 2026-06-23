@@ -193,7 +193,9 @@ class MainWindow(QMainWindow):
         tm.theme_changed.connect(lambda _: self.tcp_panel.retranslate_ui())
         tm.theme_changed.connect(lambda _: self.book_takeout_panel.apply_theme())
         tm.theme_changed.connect(lambda _: self.book_putback_panel.apply_theme())
+        tm.theme_changed.connect(lambda _: self.book_putback2_panel.apply_theme())
         tm.theme_changed.connect(lambda _: self.book_tail_putback_panel.apply_theme())
+        tm.theme_changed.connect(lambda _: self.image_recognition_panel.apply_theme())
 
         QTimer.singleShot(500, self._init_3d_model)
         if self._sim_mode:
@@ -263,6 +265,15 @@ class MainWindow(QMainWindow):
         self.book_putback_viewer = self.book_putback_panel.viewer_widget()
         self.left_stack.addWidget(self.book_putback_viewer)
 
+        self.book_putback2_panel = RealSensePointPanel(workflow_mode="putback2")
+        self.tabs.addTab(
+            self.book_putback2_panel,
+            tr("tab.book_putback2"),
+            category=MultiRowPanelTabs.LIBRARY_CATEGORY,
+        )
+        self.book_putback2_viewer = self.book_putback2_panel.viewer_widget()
+        self.left_stack.addWidget(self.book_putback2_viewer)
+
         self.book_tail_putback_panel = RealSensePointPanel(workflow_mode="tail_putback")
         self.tabs.addTab(
             self.book_tail_putback_panel,
@@ -271,6 +282,15 @@ class MainWindow(QMainWindow):
         )
         self.book_tail_putback_viewer = self.book_tail_putback_panel.viewer_widget()
         self.left_stack.addWidget(self.book_tail_putback_viewer)
+
+        self.image_recognition_panel = RealSensePointPanel(workflow_mode="image_recognition")
+        self.tabs.addTab(
+            self.image_recognition_panel,
+            tr("tab.image_recognition"),
+            category=MultiRowPanelTabs.LIBRARY_CATEGORY,
+        )
+        self.image_recognition_viewer = self.image_recognition_panel.viewer_widget()
+        self.left_stack.addWidget(self.image_recognition_viewer)
 
         self.teaching_panel = TeachingPanel()
         self.tabs.addTab(self.teaching_panel, tr("tab.teaching"))
@@ -314,7 +334,9 @@ class MainWindow(QMainWindow):
 
         self._book_takeout_tab_index = self.tabs.indexOf(self.book_takeout_panel)
         self._book_putback_tab_index = self.tabs.indexOf(self.book_putback_panel)
+        self._book_putback2_tab_index = self.tabs.indexOf(self.book_putback2_panel)
         self._book_tail_putback_tab_index = self.tabs.indexOf(self.book_tail_putback_panel)
+        self._image_recognition_tab_index = self.tabs.indexOf(self.image_recognition_panel)
         self._sync_book_header_zero_duration(
             self.joint_panel.zero_duration_spin.value()
         )
@@ -344,7 +366,9 @@ class MainWindow(QMainWindow):
         self.worker.enabled_changed.connect(self.viewer_3d.set_enabled)
         self.worker.enabled_changed.connect(self.book_takeout_panel.set_arm_enabled)
         self.worker.enabled_changed.connect(self.book_putback_panel.set_arm_enabled)
+        self.worker.enabled_changed.connect(self.book_putback2_panel.set_arm_enabled)
         self.worker.enabled_changed.connect(self.book_tail_putback_panel.set_arm_enabled)
+        self.worker.enabled_changed.connect(self.image_recognition_panel.set_arm_enabled)
         self.worker.error_occurred.connect(self._on_error)
         self.worker.log_message.connect(self._append_log)
         self.worker.can_fps_updated.connect(tb.set_fps)
@@ -355,7 +379,9 @@ class MainWindow(QMainWindow):
         self.worker.end_pose_updated.connect(self.trajectory_panel.update_current_end_pose)
         self.worker.end_pose_updated.connect(self.book_takeout_panel.update_current_end_pose)
         self.worker.end_pose_updated.connect(self.book_putback_panel.update_current_end_pose)
+        self.worker.end_pose_updated.connect(self.book_putback2_panel.update_current_end_pose)
         self.worker.end_pose_updated.connect(self.book_tail_putback_panel.update_current_end_pose)
+        self.worker.end_pose_updated.connect(self.image_recognition_panel.update_current_end_pose)
         self.worker.end_pose_updated.connect(self.viewer_3d.update_tcp_point)
         self.worker.tcp_offset_updated.connect(self.tcp_panel.set_tcp_offset)
         self.worker.tcp_offset_updated.connect(self.viewer_3d.set_tcp_offset)
@@ -391,14 +417,18 @@ class MainWindow(QMainWindow):
         tcp.tcp_apply_requested.connect(self.viewer_3d.set_tcp_offset)
         tcp.tcp_apply_requested.connect(self.book_takeout_panel.set_tcp_offset)
         tcp.tcp_apply_requested.connect(self.book_putback_panel.set_tcp_offset)
+        tcp.tcp_apply_requested.connect(self.book_putback2_panel.set_tcp_offset)
         tcp.tcp_apply_requested.connect(self.book_tail_putback_panel.set_tcp_offset)
+        tcp.tcp_apply_requested.connect(self.image_recognition_panel.set_tcp_offset)
         tcp.tcp_save_requested.connect(
             lambda offset: self.worker.submit_command("save_tcp_offset", offset)
         )
         tcp.tcp_save_requested.connect(self.viewer_3d.set_tcp_offset)
         tcp.tcp_save_requested.connect(self.book_takeout_panel.set_tcp_offset)
         tcp.tcp_save_requested.connect(self.book_putback_panel.set_tcp_offset)
+        tcp.tcp_save_requested.connect(self.book_putback2_panel.set_tcp_offset)
         tcp.tcp_save_requested.connect(self.book_tail_putback_panel.set_tcp_offset)
+        tcp.tcp_save_requested.connect(self.image_recognition_panel.set_tcp_offset)
         tcp.tcp_restore_requested.connect(
             lambda: self.worker.submit_command("restore_tcp_offset")
         )
@@ -412,15 +442,25 @@ class MainWindow(QMainWindow):
             lambda: self.book_putback_panel.set_tcp_offset([0.0] * 6)
         )
         tcp.tcp_restore_requested.connect(
+            lambda: self.book_putback2_panel.set_tcp_offset([0.0] * 6)
+        )
+        tcp.tcp_restore_requested.connect(
             lambda: self.book_tail_putback_panel.set_tcp_offset([0.0] * 6)
+        )
+        tcp.tcp_restore_requested.connect(
+            lambda: self.image_recognition_panel.set_tcp_offset([0.0] * 6)
         )
         self.worker.tcp_offset_updated.connect(self.book_takeout_panel.set_tcp_offset)
         self.worker.tcp_offset_updated.connect(self.book_putback_panel.set_tcp_offset)
+        self.worker.tcp_offset_updated.connect(self.book_putback2_panel.set_tcp_offset)
         self.worker.tcp_offset_updated.connect(self.book_tail_putback_panel.set_tcp_offset)
+        self.worker.tcp_offset_updated.connect(self.image_recognition_panel.set_tcp_offset)
 
         self._connect_point_workflow_panel(self.book_takeout_panel)
         self._connect_point_workflow_panel(self.book_putback_panel)
+        self._connect_point_workflow_panel(self.book_putback2_panel)
         self._connect_point_workflow_panel(self.book_tail_putback_panel)
+        self._connect_point_workflow_panel(self.image_recognition_panel)
 
         teach = self.teaching_panel
         teach.zero_torque_requested.connect(
@@ -573,16 +613,19 @@ class MainWindow(QMainWindow):
         self.tabs.setTabText(2, tr("tab.tcp"))
         self.tabs.setTabText(3, tr("tab.book_takeout"))
         self.tabs.setTabText(4, tr("tab.book_putback"))
-        self.tabs.setTabText(5, tr("tab.book_tail_putback"))
-        self.tabs.setTabText(6, tr("tab.teaching"))
-        self.tabs.setTabText(7, tr("tab.diagnostics"))
-        self.tabs.setTabText(8, tr("tab.gripper"))
-        self.tabs.setTabText(9, tr("tab.rodmotor"))
-        self.tabs.setTabText(10, tr("tab.gamepad"))
+        self.tabs.setTabText(5, tr("tab.book_putback2"))
+        self.tabs.setTabText(6, tr("tab.book_tail_putback"))
+        self.tabs.setTabText(7, tr("tab.image_recognition"))
+        self.tabs.setTabText(8, tr("tab.teaching"))
+        self.tabs.setTabText(9, tr("tab.diagnostics"))
+        self.tabs.setTabText(10, tr("tab.gripper"))
+        self.tabs.setTabText(11, tr("tab.rodmotor"))
+        self.tabs.setTabText(12, tr("tab.gamepad"))
 
         for panel in (self.toolbar, self.joint_panel, self.trajectory_panel,
                       self.tcp_panel, self.book_takeout_panel, self.book_putback_panel,
-                      self.book_tail_putback_panel,
+                      self.book_putback2_panel, self.book_tail_putback_panel,
+                      self.image_recognition_panel,
                       self.teaching_panel, self.diagnostics_panel, self.gripper_panel,
                       self.rodmotor_panel, self.gamepad_panel, self.viewer_3d):
             if hasattr(panel, "retranslate_ui"):
@@ -621,6 +664,7 @@ class MainWindow(QMainWindow):
         for panel in (
             self.book_takeout_panel,
             self.book_putback_panel,
+            self.book_putback2_panel,
             self.book_tail_putback_panel,
         ):
             panel.set_header_zero_duration(duration_s)
@@ -634,7 +678,9 @@ class MainWindow(QMainWindow):
             self.viewer_dock.setWindowTitle(tr("win.point_cloud_viewer"))
             self.book_takeout_panel.show_viewer()
             self.book_putback_panel.hide_viewer()
+            self.book_putback2_panel.hide_viewer()
             self.book_tail_putback_panel.hide_viewer()
+            self.image_recognition_panel.hide_viewer()
             self._adjust_dock_sizes(
                 self.viewer_dock,
                 self.tabs_dock,
@@ -646,7 +692,23 @@ class MainWindow(QMainWindow):
             self.viewer_dock.setWindowTitle(tr("win.point_cloud_viewer"))
             self.book_putback_panel.show_viewer()
             self.book_takeout_panel.hide_viewer()
+            self.book_putback2_panel.hide_viewer()
             self.book_tail_putback_panel.hide_viewer()
+            self.image_recognition_panel.hide_viewer()
+            self._adjust_dock_sizes(
+                self.viewer_dock,
+                self.tabs_dock,
+                left_ratio=0.60,
+            )
+            return
+        if index == getattr(self, "_book_putback2_tab_index", -1):
+            self.left_stack.setCurrentWidget(self.book_putback2_viewer)
+            self.viewer_dock.setWindowTitle(tr("win.point_cloud_viewer"))
+            self.book_putback2_panel.show_viewer()
+            self.book_takeout_panel.hide_viewer()
+            self.book_putback_panel.hide_viewer()
+            self.book_tail_putback_panel.hide_viewer()
+            self.image_recognition_panel.hide_viewer()
             self._adjust_dock_sizes(
                 self.viewer_dock,
                 self.tabs_dock,
@@ -659,6 +721,22 @@ class MainWindow(QMainWindow):
             self.book_tail_putback_panel.show_viewer()
             self.book_takeout_panel.hide_viewer()
             self.book_putback_panel.hide_viewer()
+            self.book_putback2_panel.hide_viewer()
+            self.image_recognition_panel.hide_viewer()
+            self._adjust_dock_sizes(
+                self.viewer_dock,
+                self.tabs_dock,
+                left_ratio=0.60,
+            )
+            return
+        if index == getattr(self, "_image_recognition_tab_index", -1):
+            self.left_stack.setCurrentWidget(self.image_recognition_viewer)
+            self.viewer_dock.setWindowTitle(tr("win.point_cloud_viewer"))
+            self.image_recognition_panel.show_viewer()
+            self.book_takeout_panel.hide_viewer()
+            self.book_putback_panel.hide_viewer()
+            self.book_putback2_panel.hide_viewer()
+            self.book_tail_putback_panel.hide_viewer()
             self._adjust_dock_sizes(
                 self.viewer_dock,
                 self.tabs_dock,
@@ -669,7 +747,9 @@ class MainWindow(QMainWindow):
         self.viewer_dock.setWindowTitle(tr("win.viewer"))
         self.book_takeout_panel.hide_viewer()
         self.book_putback_panel.hide_viewer()
+        self.book_putback2_panel.hide_viewer()
         self.book_tail_putback_panel.hide_viewer()
+        self.image_recognition_panel.hide_viewer()
         self._adjust_dock_sizes(
             self.viewer_dock,
             self.tabs_dock,
@@ -690,7 +770,9 @@ class MainWindow(QMainWindow):
         self.teaching_panel.calibration_panel.feed_positions(positions)
         self.book_takeout_panel.update_joint_feedback(joint_states)
         self.book_putback_panel.update_joint_feedback(joint_states)
+        self.book_putback2_panel.update_joint_feedback(joint_states)
         self.book_tail_putback_panel.update_joint_feedback(joint_states)
+        self.image_recognition_panel.update_joint_feedback(joint_states)
 
         now = time.monotonic()
         if now - self._last_ui_update_time < self.UI_UPDATE_INTERVAL_S:
@@ -732,7 +814,9 @@ class MainWindow(QMainWindow):
         self.gamepad_panel.cleanup()
         self.book_takeout_panel.cleanup()
         self.book_putback_panel.cleanup()
+        self.book_putback2_panel.cleanup()
         self.book_tail_putback_panel.cleanup()
+        self.image_recognition_panel.cleanup()
         if self.monitoring_window.isVisible():
             self.monitoring_window.close()
         self.worker.stop()

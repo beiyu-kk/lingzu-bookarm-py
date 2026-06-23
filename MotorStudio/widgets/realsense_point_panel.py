@@ -5,13 +5,17 @@ from __future__ import annotations
 import logging
 import math
 import json
+import importlib.util
+import os
+import sys
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, Sequence
 
 import numpy as np
 
-from PyQt6.QtCore import QEvent, QSignalBlocker, QThread, Qt, pyqtSignal
+from PyQt6.QtCore import QEvent, QSignalBlocker, QThread, QTimer, Qt, pyqtSignal
 from PyQt6.QtGui import QImage, QPixmap
 from PyQt6.QtWidgets import (
     QApplication,
@@ -107,6 +111,44 @@ WORKFLOW_DEFAULTS_CONFIG_VERSION = 1
 WORKFLOW_DEFAULTS_PATH = get_tcp_offset_path().with_name(
     "motorstudio_book_workflow_defaults.json"
 )
+BOOK_SPINE_INFERENCE_DIR = (
+    Path(__file__).resolve().parents[2] / "book_spine_inference_light"
+)
+BOOK_SPINE_INFER_PATH = BOOK_SPINE_INFERENCE_DIR / "infer.py"
+BOOK_SPINE_WEIGHTS_PATH = BOOK_SPINE_INFERENCE_DIR / "weights" / "best.pt"
+BOOK_SPINE_SEGMENT_OUTPUT_DIR = (
+    Path(__file__).resolve().parents[2]
+    / "recordings"
+    / "realsense"
+    / "book_spine_segmentation"
+)
+BOOK_SPINE_SEGMENT_IMGSZ = 640
+BOOK_SPINE_SEGMENT_CONF = 0.60
+BOOK_SPINE_SEGMENT_IOU = 0.6
+BOOK_SPINE_SEGMENT_MAX_DET = 30
+BOOK_SPINE_SEGMENT_RETINA_MASKS = False
+BOOK_SPINE_SEGMENT_SAVE_CROPS = False
+BOOK_SPINE_SEGMENT_DEVICE = "cpu"
+
+
+def _book_spine_thread_count() -> int:
+    try:
+        value = int(os.environ.get("MOTORSTUDIO_BOOK_SPINE_THREADS", "2") or 2)
+    except (TypeError, ValueError):
+        value = 2
+    return max(1, min(2, value))
+
+
+BOOK_SPINE_SEGMENT_THREADS = _book_spine_thread_count()
+BOOK_SPINE_SEGMENT_CAPTURE_WIDTH = 640
+BOOK_SPINE_SEGMENT_CAPTURE_HEIGHT = 480
+BOOK_SPINE_SEGMENT_CAPTURE_DEPTH_WIDTH = 640
+BOOK_SPINE_SEGMENT_CAPTURE_DEPTH_HEIGHT = 480
+BOOK_SPINE_SEGMENT_WARMUP = 8
+for _thread_env_name in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS"):
+    os.environ.setdefault(_thread_env_name, str(BOOK_SPINE_SEGMENT_THREADS))
+_BOOK_SPINE_SEGMENT_MODEL = None
+_BOOK_SPINE_SEGMENT_MODEL_PATH: Optional[Path] = None
 
 
 def _load_book_workflow_defaults(mode: str) -> dict:
@@ -135,6 +177,55 @@ def _save_book_workflow_defaults(mode: str, values: dict):
     WORKFLOW_DEFAULTS_PATH.parent.mkdir(parents=True, exist_ok=True)
     with WORKFLOW_DEFAULTS_PATH.open("w", encoding="utf-8") as file:
         json.dump(payload, file, ensure_ascii=False, indent=2)
+
+
+def _load_book_spine_infer_module():
+    if not BOOK_SPINE_INFER_PATH.exists():
+        raise FileNotFoundError(f"未找到书脊分割脚本: {BOOK_SPINE_INFER_PATH}")
+    module_name = "_motorstudio_book_spine_inference_light"
+    module = sys.modules.get(module_name)
+    if module is not None:
+        return module
+    spec = importlib.util.spec_from_file_location(
+        module_name,
+        BOOK_SPINE_INFER_PATH,
+    )
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"无法加载书脊分割脚本: {BOOK_SPINE_INFER_PATH}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[module_name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def _load_book_spine_segment_model(weights_path: Path = BOOK_SPINE_WEIGHTS_PATH):
+    global _BOOK_SPINE_SEGMENT_MODEL, _BOOK_SPINE_SEGMENT_MODEL_PATH
+    weights_path = Path(weights_path)
+    if not weights_path.exists():
+        raise FileNotFoundError(f"未找到书脊分割模型权重: {weights_path}")
+    if _BOOK_SPINE_SEGMENT_MODEL is not None and _BOOK_SPINE_SEGMENT_MODEL_PATH == weights_path:
+        return _BOOK_SPINE_SEGMENT_MODEL
+    from ultralytics import YOLO
+    try:
+        import torch
+
+        torch.set_num_threads(BOOK_SPINE_SEGMENT_THREADS)
+        torch.set_num_interop_threads(1)
+    except Exception:
+        pass
+    if cv2 is not None:
+        try:
+            cv2.setNumThreads(BOOK_SPINE_SEGMENT_THREADS)
+        except Exception:
+            pass
+
+    _BOOK_SPINE_SEGMENT_MODEL = YOLO(str(weights_path))
+    try:
+        _BOOK_SPINE_SEGMENT_MODEL.to(BOOK_SPINE_SEGMENT_DEVICE)
+    except Exception:
+        pass
+    _BOOK_SPINE_SEGMENT_MODEL_PATH = weights_path
+    return _BOOK_SPINE_SEGMENT_MODEL
 
 
 # Camera -> robot base extrinsic:
@@ -268,6 +359,18 @@ def camera_point_to_robot_target(
     return (CAMERA_TO_ROBOT_MATRIX @ camera_point_h)[:3]
 
 
+@dataclass(frozen=True)
+class BookGapResult:
+    left_index: int
+    right_index: int
+    gap_width_px: float
+    line_top_uv: tuple[int, int]
+    line_bottom_uv: tuple[int, int]
+    midpoint_uv: tuple[int, int]
+    camera_point_m: np.ndarray
+    robot_point_m: np.ndarray
+
+
 def _format_vec_m(values: Sequence[float]) -> str:
     vals = np.asarray(values, dtype=float).reshape(3)
     return f"X={vals[0]:.4f} m, Y={vals[1]:.4f} m, Z={vals[2]:.4f} m"
@@ -278,8 +381,155 @@ def _format_vec_cm(values: Sequence[float]) -> str:
     return f"X={vals[0]:.2f} cm, Y={vals[1]:.2f} cm, Z={vals[2]:.2f} cm"
 
 
+def _crop_polygon(crop) -> Optional[np.ndarray]:
+    polygon = getattr(crop, "polygon_xy", None)
+    if polygon is not None:
+        points = np.asarray(polygon, dtype=float).reshape(-1, 2)
+        if len(points) >= 3:
+            return points
+    bbox = getattr(crop, "bbox_xyxy", None)
+    if bbox is None:
+        return None
+    x1, y1, x2, y2 = np.asarray(bbox, dtype=float).reshape(4)
+    if x2 <= x1 or y2 <= y1:
+        return None
+    return np.array(
+        [
+            [x1, y1],
+            [x2, y1],
+            [x2, y2],
+            [x1, y2],
+        ],
+        dtype=float,
+    )
+
+
+def _polygon_x_range_at_y(polygon: np.ndarray, y: float) -> Optional[tuple[float, float]]:
+    points = np.asarray(polygon, dtype=float).reshape(-1, 2)
+    if len(points) < 3:
+        return None
+    intersections: list[float] = []
+    for start, end in zip(points, np.roll(points, -1, axis=0), strict=False):
+        x1, y1 = float(start[0]), float(start[1])
+        x2, y2 = float(end[0]), float(end[1])
+        if math.isclose(y1, y2):
+            continue
+        if (y1 <= y < y2) or (y2 <= y < y1):
+            t = (float(y) - y1) / (y2 - y1)
+            intersections.append(x1 + t * (x2 - x1))
+    if len(intersections) < 2:
+        return None
+    intersections.sort()
+    return float(intersections[0]), float(intersections[-1])
+
+
+def _find_largest_book_gap(
+    crops: Sequence[object],
+    frame,
+    *,
+    max_depth_m: float,
+    min_overlap_px: float = 20.0,
+    samples_per_gap: int = 15,
+) -> BookGapResult:
+    spines: list[dict[str, object]] = []
+    for crop in crops:
+        polygon = _crop_polygon(crop)
+        if polygon is None:
+            continue
+        min_xy = polygon.min(axis=0)
+        max_xy = polygon.max(axis=0)
+        width = float(max_xy[0] - min_xy[0])
+        height = float(max_xy[1] - min_xy[1])
+        if width <= 1.0 or height <= 1.0:
+            continue
+        spines.append(
+            {
+                "index": int(getattr(crop, "index", len(spines) + 1)),
+                "polygon": polygon,
+                "center_x": float((min_xy[0] + max_xy[0]) * 0.5),
+                "y_min": float(min_xy[1]),
+                "y_max": float(max_xy[1]),
+            }
+        )
+    spines.sort(key=lambda item: float(item["center_x"]))
+    if len(spines) < 2:
+        raise ValueError("书脊数量少于 2，无法计算书缝。")
+
+    best: Optional[dict[str, object]] = None
+    for left, right in zip(spines, spines[1:], strict=False):
+        overlap_top = max(float(left["y_min"]), float(right["y_min"]))
+        overlap_bottom = min(float(left["y_max"]), float(right["y_max"]))
+        if overlap_bottom - overlap_top < min_overlap_px:
+            continue
+        y_values = np.linspace(overlap_top, overlap_bottom, max(3, int(samples_per_gap)))
+        line_points: list[tuple[float, float]] = []
+        widths: list[float] = []
+        for y in y_values:
+            left_range = _polygon_x_range_at_y(np.asarray(left["polygon"]), float(y))
+            right_range = _polygon_x_range_at_y(np.asarray(right["polygon"]), float(y))
+            if left_range is None or right_range is None:
+                continue
+            left_edge = float(left_range[1])
+            right_edge = float(right_range[0])
+            gap_width = right_edge - left_edge
+            if gap_width <= 0.0:
+                continue
+            widths.append(gap_width)
+            line_points.append(((left_edge + right_edge) * 0.5, float(y)))
+        if len(line_points) < 2:
+            continue
+        avg_width = float(np.mean(widths))
+        if best is None or avg_width > float(best["gap_width_px"]):
+            best = {
+                "left_index": int(left["index"]),
+                "right_index": int(right["index"]),
+                "gap_width_px": avg_width,
+                "line_points": line_points,
+            }
+    if best is None:
+        raise ValueError("未找到有效的相邻书缝。")
+
+    line_points = list(best["line_points"])
+    top_x, top_y = line_points[0]
+    bottom_x, bottom_y = line_points[-1]
+    mid_x = float(np.mean([point[0] for point in line_points]))
+    mid_y = float(np.mean([point[1] for point in line_points]))
+    height, width = frame.depth_m.shape
+
+    def clamp_uv(x: float, y: float) -> tuple[int, int]:
+        u = max(0, min(width - 1, int(round(x))))
+        v = max(0, min(height - 1, int(round(y))))
+        return u, v
+
+    midpoint_uv = clamp_uv(mid_x, mid_y)
+    camera_point = np.asarray(
+        frame.point_at_pixel(
+            midpoint_uv[0],
+            midpoint_uv[1],
+            search_radius=12,
+            max_depth_m=max_depth_m,
+        ),
+        dtype=float,
+    )
+    robot_point = camera_point_to_robot_target(camera_point)
+    return BookGapResult(
+        left_index=int(best["left_index"]),
+        right_index=int(best["right_index"]),
+        gap_width_px=float(best["gap_width_px"]),
+        line_top_uv=clamp_uv(top_x, top_y),
+        line_bottom_uv=clamp_uv(bottom_x, bottom_y),
+        midpoint_uv=midpoint_uv,
+        camera_point_m=camera_point,
+        robot_point_m=robot_point,
+    )
+
+
 def _normalize_book_workflow_mode(workflow_mode: str) -> str:
     mode = str(workflow_mode).lower()
+    if mode in {"image_recognition", "image", "vision", "spine_segmentation", "book_spine_segmentation"}:
+        return "image_recognition"
+    if mode in {"putback2", "putback_2", "return2", "book_putback2"}:
+        return "putback2"
     if mode in {"putback", "return", "put_back"}:
         return "putback"
     if mode in {"tail_putback", "tail_return", "end_putback", "book_tail_putback"}:
@@ -289,6 +539,14 @@ def _normalize_book_workflow_mode(workflow_mode: str) -> str:
 
 def _is_putback_workflow_mode(workflow_mode: str) -> bool:
     return _normalize_book_workflow_mode(workflow_mode) in {"putback", "tail_putback"}
+
+
+def _is_takeout_based_workflow_mode(workflow_mode: str) -> bool:
+    return _normalize_book_workflow_mode(workflow_mode) in {"takeout", "putback2"}
+
+
+def _is_image_recognition_workflow_mode(workflow_mode: str) -> bool:
+    return _normalize_book_workflow_mode(workflow_mode) == "image_recognition"
 
 
 def _book_pick_point_from_polygon(
@@ -562,6 +820,121 @@ class BookSpineDetectWorker(QThread):
             self.error_occurred.emit(str(exc))
 
 
+class BookSpineSegmentWorker(QThread):
+    """Capture one color frame and run YOLO book-spine segmentation."""
+
+    segmentation_finished = pyqtSignal(object)
+    status_message = pyqtSignal(str)
+    error_occurred = pyqtSignal(str)
+
+    def __init__(
+        self,
+        *,
+        serial: Optional[str],
+        width: int,
+        height: int,
+        fps: int,
+        warmup: int,
+        timeout_ms: int,
+        align_depth_to_color: bool,
+        depth_min_m: float,
+        depth_max_m: float,
+        stride: int,
+        include_color: bool,
+        depth_width: int,
+        depth_height: int,
+        parent=None,
+    ):
+        super().__init__(parent)
+        self.serial = serial
+        self.width = width
+        self.height = height
+        self.fps = fps
+        self.warmup = warmup
+        self.timeout_ms = timeout_ms
+        self.align_depth_to_color = align_depth_to_color
+        self.depth_min_m = depth_min_m
+        self.depth_max_m = depth_max_m
+        self.stride = stride
+        self.include_color = include_color
+        self.depth_width = depth_width
+        self.depth_height = depth_height
+
+    def run(self):
+        try:
+            from el_a3_sdk.realsense import RealSenseD435
+
+            with RealSenseD435(
+                width=self.width,
+                height=self.height,
+                fps=self.fps,
+                serial=self.serial or None,
+                align_depth_to_color=self.align_depth_to_color,
+                depth_width=self.depth_width,
+                depth_height=self.depth_height,
+            ) as camera:
+                if self.isInterruptionRequested():
+                    return
+                self.status_message.emit("正在预热并拍摄图像...")
+                camera.warmup(frame_count=self.warmup, timeout_ms=self.timeout_ms)
+                if self.isInterruptionRequested():
+                    return
+                frame = camera.get_frame(timeout_ms=self.timeout_ms)
+                if self.isInterruptionRequested():
+                    return
+
+            self.status_message.emit("正在加载模型并分割书脊...")
+            infer_module = _load_book_spine_infer_module()
+            model = _load_book_spine_segment_model()
+            self.status_message.emit(
+                f"正在分割书脊(imgsz={BOOK_SPINE_SEGMENT_IMGSZ}, "
+                f"max_det={BOOK_SPINE_SEGMENT_MAX_DET}, threads={BOOK_SPINE_SEGMENT_THREADS})..."
+            )
+            timestamp = time.strftime("%Y%m%d_%H%M%S")
+            capture_dir = BOOK_SPINE_SEGMENT_OUTPUT_DIR / "captures"
+            capture_dir.mkdir(parents=True, exist_ok=True)
+            image_path = capture_dir / f"book_spine_{timestamp}_frame{frame.frame_number}.jpg"
+            if cv2 is None:
+                raise RuntimeError("书脊分割需要 opencv-python。")
+            cv2.imwrite(str(image_path), frame.color_bgr)
+            overlay_path, crops = infer_module.segment_image(
+                model=model,
+                image_path=image_path,
+                output_dir=BOOK_SPINE_SEGMENT_OUTPUT_DIR,
+                imgsz=BOOK_SPINE_SEGMENT_IMGSZ,
+                conf=BOOK_SPINE_SEGMENT_CONF,
+                iou=BOOK_SPINE_SEGMENT_IOU,
+                pad=8,
+                retina_masks=BOOK_SPINE_SEGMENT_RETINA_MASKS,
+                max_det=BOOK_SPINE_SEGMENT_MAX_DET,
+                device=BOOK_SPINE_SEGMENT_DEVICE,
+                save_crops=BOOK_SPINE_SEGMENT_SAVE_CROPS,
+            )
+            gap_result = None
+            gap_error = ""
+            try:
+                gap_result = _find_largest_book_gap(
+                    crops,
+                    frame,
+                    max_depth_m=self.depth_max_m,
+                )
+            except Exception as exc:
+                gap_error = str(exc)
+            payload = {
+                "ok": True,
+                "frame": frame,
+                "image_path": image_path,
+                "overlay_path": overlay_path,
+                "spine_count": len(crops),
+                "crops": crops,
+                "gap_result": gap_result,
+                "gap_error": gap_error,
+            }
+            self.segmentation_finished.emit(payload)
+        except Exception as exc:
+            self.error_occurred.emit(str(exc))
+
+
 class RealSensePointPanel(QWidget):
     """Point cloud capture, target picking, and MoveL confirmation page."""
 
@@ -589,7 +962,9 @@ class RealSensePointPanel(QWidget):
     DEFAULT_ROD_ACC = 50
     DEFAULT_ROD_TORQUE = 1.0
     DEFAULT_TARGET_COMPENSATION_CM = (0.0, -1.0, -5.0)
+    DEFAULT_PUTBACK2_TARGET_COMPENSATION_CM = (-1.0, 1.0, 1.0)
     DEFAULT_ROD_GRASP_DEG = 115.0
+    DEFAULT_PUTBACK2_ROD_GRASP_DEG = -90.0
     DEFAULT_PREGRASP_OFFSET_CM = (10.0, 0.0, 0.0)
     DEFAULT_GRIPPER_OPEN_DEG = 0.0
     DEFAULT_GRIPPER_CLOSE_DEG = 108.5
@@ -599,7 +974,9 @@ class RealSensePointPanel(QWidget):
     DEFAULT_GRIPPER_KP = 18.0
     DEFAULT_GRIPPER_KD = 2.0
     DEFAULT_GRIPPER_CLOSE_SPEED_DEG_S = 16.7
+    DEFAULT_PUTBACK2_GRIPPER_CLOSE_SPEED_DEG_S = 40.0
     DEFAULT_GRASP_RPY_DEG = (75.0, 0.0, 90.0)
+    DEFAULT_PUTBACK2_GRASP_RPY_DEG = (65.0, 0.0, 90.0)
     DEFAULT_FLOW_MOVEL_DURATION_S = 2.0
     GRIPPER_CLOSE_TOLERANCE_DEG = 2.0
     GRIPPER_CLOSE_STALL_TOLERANCE_DEG = 0.8
@@ -627,6 +1004,30 @@ class RealSensePointPanel(QWidget):
     DEFAULT_POST_GRIPPER_MOVEJ_OFFSET_CM = (0.0, 0.0, 0.0)
     DEFAULT_POST_GRIPPER_MOVEJ_RPY_OFFSET_DEG = (0.0, 0.0, 0.0)
     DEFAULT_POST_GRIPPER_MOVEJ_DURATION_S = 2.0
+    DEFAULT_PUTBACK2_RESET_RPY_DEG = (90.0, 0.0, 90.0)
+    DEFAULT_PUTBACK2_RESET_RPY_DURATION_S = 2.0
+    DEFAULT_PUTBACK2_X_OFFSET_CM = -5.0
+    DEFAULT_PUTBACK2_X_MOVE_DURATION_S = 2.0
+    DEFAULT_PUTBACK2_GRIPPER_PARTIAL_OPEN_DEG = 90.0
+    DEFAULT_PUTBACK2_GRIPPER_PARTIAL_OPEN_SPEED_DEG_S = 8.0
+    DEFAULT_PUTBACK2_ROD_RELEASE_DEG = 90.0
+    DEFAULT_PUTBACK2_Z_OFFSET_CM = -10.0
+    DEFAULT_PUTBACK2_Z_MOVE_DURATION_S = 2.0
+    DEFAULT_PUTBACK2_GRIPPER_FULL_OPEN_DEG = 0.0
+    DEFAULT_PUTBACK2_GRIPPER_FULL_OPEN_SPEED_DEG_S = 8.0
+    DEFAULT_PUTBACK2_AFTER_OPEN_X1_OFFSET_CM = 10.0
+    DEFAULT_PUTBACK2_AFTER_OPEN_X1_DURATION_S = 2.0
+    DEFAULT_PUTBACK2_COMBO_CLOSE_DEG = 108.5
+    DEFAULT_PUTBACK2_COMBO_CLOSE_SPEED_DEG_S = 40.0
+    DEFAULT_PUTBACK2_COMBO_Y_OFFSET_CM = 2.0
+    DEFAULT_PUTBACK2_COMBO_Y_DURATION_S = 2.0
+    DEFAULT_PUTBACK2_COMBO_WAIT_S = 2.0
+    DEFAULT_PUTBACK2_COMBO_X_OFFSET_CM = -10.0
+    DEFAULT_PUTBACK2_COMBO_X_DURATION_S = 2.0
+    DEFAULT_PUTBACK2_COMBO_FULL_OPEN_DEG = 0.0
+    DEFAULT_PUTBACK2_COMBO_FULL_OPEN_SPEED_DEG_S = 8.0
+    DEFAULT_PUTBACK2_AFTER_COMBO_X_OFFSET_CM = 10.0
+    DEFAULT_PUTBACK2_AFTER_COMBO_X_DURATION_S = 2.0
     DEFAULT_FINAL_JOINTS_DEG = (-119.64, 67.09, 67.22, 2.23, 51.75, -14.65)
     DEFAULT_TURN_DURATION_S = 6.0
     DEFAULT_DEBUG_MOVE_DURATION_S = 3.0
@@ -651,6 +1052,7 @@ class RealSensePointPanel(QWidget):
         self._workflow_mode = _normalize_book_workflow_mode(workflow_mode)
         self._capture_worker: Optional[RealSenseCaptureWorker] = None
         self._detect_worker: Optional[BookSpineDetectWorker] = None
+        self._segment_worker: Optional[BookSpineSegmentWorker] = None
         self._frame = None
         self._point_cloud = None
         self._display_indices: Optional[np.ndarray] = None
@@ -667,6 +1069,7 @@ class RealSensePointPanel(QWidget):
         self._target_robot_point_m: Optional[np.ndarray] = None
         self._tail_putback_bottom_point_m: Optional[np.ndarray] = None
         self._book_spine_pick: Optional[object] = None
+        self._segmentation_result: Optional[dict] = None
         self._tcp_offset = np.zeros(6, dtype=float)
         self._header_zero_duration_s = float(self.HEADER_MOVE_DURATION_S)
         self._current_end_pose = None
@@ -724,7 +1127,8 @@ class RealSensePointPanel(QWidget):
         root.setContentsMargins(4, 4, 4, 4)
         root.setSpacing(6)
 
-        root.addWidget(self._create_workflow_header())
+        if not self._is_image_recognition_workflow():
+            root.addWidget(self._create_workflow_header())
 
         controls_container = QWidget()
         controls_layout = QVBoxLayout(controls_container)
@@ -738,7 +1142,10 @@ class RealSensePointPanel(QWidget):
         ]
         for group in self._hidden_control_groups:
             group.hide()
-        controls_layout.addWidget(self._create_book_grasp_group())
+        if self._is_image_recognition_workflow():
+            controls_layout.addWidget(self._create_image_recognition_group())
+        else:
+            controls_layout.addWidget(self._create_book_grasp_group())
         controls_layout.addStretch()
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
@@ -940,6 +1347,59 @@ class RealSensePointPanel(QWidget):
         layout.setVerticalSpacing(6)
         return self.book_group
 
+    def _create_image_recognition_group(self):
+        self.image_recognition_group = QGroupBox(tr("pc.image_recognition_group"))
+        layout = QGridLayout(self.image_recognition_group)
+        layout.setHorizontalSpacing(8)
+        layout.setVerticalSpacing(6)
+
+        self.image_detect_btn = QPushButton(tr("pc.image_detect"))
+        self.image_detect_btn.setObjectName("enableBtn")
+        self.image_detect_btn.clicked.connect(self._start_book_spine_segmentation)
+        layout.addWidget(self.image_detect_btn, 0, 0)
+        layout.setColumnStretch(1, 1)
+
+        self.image_status_label = QLabel(tr("pc.image_ready"))
+        self.image_status_label.setWordWrap(True)
+        self._stabilize_flow_label(self.image_status_label)
+        layout.addWidget(self.image_status_label, 1, 0, 1, 5)
+
+        self.segment_preview_label = QLabel("分割结果预览")
+        self.segment_preview_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.segment_preview_label.setMinimumSize(420, 320)
+        self.segment_preview_label.setStyleSheet(
+            "QLabel { background: rgba(15, 18, 24, 210); border: 1px solid rgba(255, 255, 255, 120); }"
+        )
+        self.segment_preview_label.setScaledContents(False)
+        layout.addWidget(self.segment_preview_label, 2, 0, 1, 5)
+
+        self.segment_count_label = QLabel("识别到书脊数量: --")
+        self.segment_count_label.setWordWrap(True)
+        layout.addWidget(self.segment_count_label, 3, 0, 1, 5)
+        self.segment_gap_label = QLabel("Step2 最大书缝: --")
+        self.segment_gap_label.setWordWrap(True)
+        layout.addWidget(self.segment_gap_label, 4, 0, 1, 5)
+        self.segment_gap_line_label = QLabel("中线像素: --")
+        self.segment_gap_line_label.setWordWrap(True)
+        layout.addWidget(self.segment_gap_line_label, 5, 0, 1, 5)
+        self.segment_gap_pixel_label = QLabel("中线中点像素: --")
+        self.segment_gap_pixel_label.setWordWrap(True)
+        layout.addWidget(self.segment_gap_pixel_label, 6, 0, 1, 5)
+        self.segment_gap_camera_label = QLabel("中点点云坐标: --")
+        self.segment_gap_camera_label.setWordWrap(True)
+        layout.addWidget(self.segment_gap_camera_label, 7, 0, 1, 5)
+        self.segment_gap_robot_label = QLabel("机械臂末端点坐标: --")
+        self.segment_gap_robot_label.setWordWrap(True)
+        layout.addWidget(self.segment_gap_robot_label, 8, 0, 1, 5)
+        self.segment_output_label = QLabel("输出路径: --")
+        self.segment_output_label.setWordWrap(True)
+        layout.addWidget(self.segment_output_label, 9, 0, 1, 5)
+
+        hint = QLabel("Step1 分割书脊；Step2 根据相邻书脊轮廓计算最大书缝中线和中点坐标。")
+        hint.setWordWrap(True)
+        layout.addWidget(hint, 10, 0, 1, 5)
+        return self.image_recognition_group
+
     def _create_result_group(self):
         self.result_group = QGroupBox(tr("pc.result_group"))
         layout = QFormLayout(self.result_group)
@@ -1000,7 +1460,7 @@ class RealSensePointPanel(QWidget):
         layout.setVerticalSpacing(6)
 
         row = 0
-        if self._workflow_mode == "takeout":
+        if self._is_takeout_based_workflow():
             step1, step1_layout = self._create_step_group("步骤1：采集点云")
             layout.addWidget(step1, row, 0, 1, 5)
             step1_layout.addWidget(QLabel("点云采集由顶部流程按钮触发"), 0, 0, 1, 5)
@@ -1039,7 +1499,12 @@ class RealSensePointPanel(QWidget):
             comp_row.setContentsMargins(0, 0, 0, 0)
             comp_row.setSpacing(4)
             self.target_comp_xyz_spins = []
-            for value in self.DEFAULT_TARGET_COMPENSATION_CM:
+            target_comp_defaults = (
+                self.DEFAULT_PUTBACK2_TARGET_COMPENSATION_CM
+                if self._workflow_mode == "putback2"
+                else self.DEFAULT_TARGET_COMPENSATION_CM
+            )
+            for value in target_comp_defaults:
                 spin = self._make_float_spin(-50.0, 50.0, value, 0.5, " cm")
                 self.target_comp_xyz_spins.append(spin)
                 comp_row.addWidget(spin)
@@ -1076,7 +1541,12 @@ class RealSensePointPanel(QWidget):
         self._add_row_spins(group_layout, 0, "预备偏移XYZ:", self.pregrasp_offset_xyz_spins)
 
         self.pregrasp_rpy_spins = []
-        for value in self.DEFAULT_GRASP_RPY_DEG:
+        pregrasp_rpy_defaults = (
+            self.DEFAULT_PUTBACK2_GRASP_RPY_DEG
+            if self._workflow_mode == "putback2"
+            else self.DEFAULT_GRASP_RPY_DEG
+        )
+        for value in pregrasp_rpy_defaults:
             spin = self._make_float_spin(-180.0, 180.0, value, 1.0, "°")
             self.pregrasp_rpy_spins.append(spin)
         self.grasp_rpy_spins = self.pregrasp_rpy_spins
@@ -1100,7 +1570,12 @@ class RealSensePointPanel(QWidget):
         self.rod_port_edit.setFixedWidth(150)
         step6_layout.addWidget(self.rod_port_edit, 0, 1)
         step6_layout.addWidget(QLabel("杆夹取位:"), 0, 2)
-        self.rod_grasp_spin = self._make_float_spin(-180.0, 180.0, self.DEFAULT_ROD_GRASP_DEG, 1.0, "°")
+        rod_grasp_default = (
+            self.DEFAULT_PUTBACK2_ROD_GRASP_DEG
+            if self._workflow_mode == "putback2"
+            else self.DEFAULT_ROD_GRASP_DEG
+        )
+        self.rod_grasp_spin = self._make_float_spin(-180.0, 180.0, rod_grasp_default, 1.0, "°")
         step6_layout.addWidget(self.rod_grasp_spin, 0, 3)
         step6_layout.addWidget(QLabel("速度:"), 1, 0)
         self.rod_speed_spin = self._make_int_spin(1, 10000, self.DEFAULT_ROD_SPEED, 100)
@@ -1161,7 +1636,11 @@ class RealSensePointPanel(QWidget):
         self.gripper_close_speed_spin = self._make_float_spin(
             1.0,
             60.0,
-            self.DEFAULT_GRIPPER_CLOSE_SPEED_DEG_S,
+            (
+                self.DEFAULT_PUTBACK2_GRIPPER_CLOSE_SPEED_DEG_S
+                if self._workflow_mode == "putback2"
+                else self.DEFAULT_GRIPPER_CLOSE_SPEED_DEG_S
+            ),
             0.5,
             "°/s",
         )
@@ -1188,6 +1667,285 @@ class RealSensePointPanel(QWidget):
             "闭合速度:",
             self.gripper_close_speed_spin,
         )
+
+        if self._workflow_mode == "putback2":
+            step9, step9_layout = self._create_step_group("步骤9：姿态恢复到默认RPY")
+            layout.addWidget(step9, base_row + 5, 0, 1, 5)
+            self.putback2_reset_rpy_spins = []
+            for value in self.DEFAULT_PUTBACK2_RESET_RPY_DEG:
+                spin = self._make_float_spin(-180.0, 180.0, value, 1.0, "°")
+                self.putback2_reset_rpy_spins.append(spin)
+            self._add_row_spins(step9_layout, 0, "目标Rx/Ry/Rz:", self.putback2_reset_rpy_spins)
+            self.putback2_reset_rpy_duration_spin = self._make_float_spin(
+                0.5,
+                30.0,
+                self.DEFAULT_PUTBACK2_RESET_RPY_DURATION_S,
+                0.5,
+                " s",
+            )
+            self._add_compact_value_row(
+                step9_layout,
+                1,
+                "MoveJ时间:",
+                self.putback2_reset_rpy_duration_spin,
+            )
+
+            step10, step10_layout = self._create_step_group("步骤10：沿基坐标X+移动")
+            layout.addWidget(step10, base_row + 6, 0, 1, 5)
+            self.putback2_x_offset_spin = self._make_float_spin(
+                -50.0,
+                50.0,
+                self.DEFAULT_PUTBACK2_X_OFFSET_CM,
+                0.5,
+                " cm",
+            )
+            self._add_compact_value_row(step10_layout, 0, "X偏移:", self.putback2_x_offset_spin)
+            self.putback2_x_move_duration_spin = self._make_float_spin(
+                0.5,
+                30.0,
+                self.DEFAULT_PUTBACK2_X_MOVE_DURATION_S,
+                0.5,
+                " s",
+            )
+            self._add_compact_value_row(
+                step10_layout,
+                1,
+                "MoveL时间:",
+                self.putback2_x_move_duration_spin,
+            )
+
+            step11, step11_layout = self._create_step_group("步骤11：夹爪开一点")
+            layout.addWidget(step11, base_row + 7, 0, 1, 5)
+            self.putback2_gripper_partial_open_spin = self._make_float_spin(
+                -30.0,
+                140.0,
+                self.DEFAULT_PUTBACK2_GRIPPER_PARTIAL_OPEN_DEG,
+                1.0,
+                "°",
+            )
+            self._add_compact_value_row(
+                step11_layout,
+                0,
+                "开一点角度:",
+                self.putback2_gripper_partial_open_spin,
+            )
+            self.putback2_gripper_partial_open_speed_spin = self._make_float_spin(
+                1.0,
+                60.0,
+                self.DEFAULT_PUTBACK2_GRIPPER_PARTIAL_OPEN_SPEED_DEG_S,
+                0.5,
+                "°/s",
+            )
+            self._add_compact_value_row(
+                step11_layout,
+                1,
+                "张开速度:",
+                self.putback2_gripper_partial_open_speed_spin,
+            )
+
+            step12, step12_layout = self._create_step_group("步骤12：杆电机运动到90°")
+            layout.addWidget(step12, base_row + 8, 0, 1, 5)
+            self.putback2_rod_release_spin = self._make_float_spin(
+                -180.0,
+                180.0,
+                self.DEFAULT_PUTBACK2_ROD_RELEASE_DEG,
+                1.0,
+                "°",
+            )
+            self._add_compact_value_row(
+                step12_layout,
+                0,
+                "杆目标角度:",
+                self.putback2_rod_release_spin,
+            )
+            step12_layout.addWidget(QLabel("速度/加速度: 同步骤6"), 1, 0, 1, 5)
+
+            step13, step13_layout = self._create_step_group("步骤13：机械臂Z方向移动")
+            layout.addWidget(step13, base_row + 9, 0, 1, 5)
+            self.putback2_z_offset_spin = self._make_float_spin(
+                -50.0,
+                50.0,
+                self.DEFAULT_PUTBACK2_Z_OFFSET_CM,
+                0.5,
+                " cm",
+            )
+            self._add_compact_value_row(step13_layout, 0, "Z偏移:", self.putback2_z_offset_spin)
+            self.putback2_z_move_duration_spin = self._make_float_spin(
+                0.5,
+                30.0,
+                self.DEFAULT_PUTBACK2_Z_MOVE_DURATION_S,
+                0.5,
+                " s",
+            )
+            self._add_compact_value_row(
+                step13_layout,
+                1,
+                "MoveL时间:",
+                self.putback2_z_move_duration_spin,
+            )
+
+            step14, step14_layout = self._create_step_group("步骤14：夹爪全部张开")
+            layout.addWidget(step14, base_row + 10, 0, 1, 5)
+            self.putback2_gripper_full_open_spin = self._make_float_spin(
+                -30.0,
+                140.0,
+                self.DEFAULT_PUTBACK2_GRIPPER_FULL_OPEN_DEG,
+                1.0,
+                "°",
+            )
+            self._add_compact_value_row(
+                step14_layout,
+                0,
+                "全开角度:",
+                self.putback2_gripper_full_open_spin,
+            )
+            self.putback2_gripper_full_open_speed_spin = self._make_float_spin(
+                1.0,
+                60.0,
+                self.DEFAULT_PUTBACK2_GRIPPER_FULL_OPEN_SPEED_DEG_S,
+                0.5,
+                "°/s",
+            )
+            self._add_compact_value_row(
+                step14_layout,
+                1,
+                "张开速度:",
+                self.putback2_gripper_full_open_speed_spin,
+            )
+
+            step15, step15_layout = self._create_step_group("步骤15：机械臂X+移动")
+            layout.addWidget(step15, base_row + 11, 0, 1, 5)
+            self.putback2_after_open_x1_offset_spin = self._make_float_spin(
+                -50.0,
+                50.0,
+                self.DEFAULT_PUTBACK2_AFTER_OPEN_X1_OFFSET_CM,
+                0.5,
+                " cm",
+            )
+            self._add_compact_value_row(
+                step15_layout,
+                0,
+                "X偏移:",
+                self.putback2_after_open_x1_offset_spin,
+            )
+            self.putback2_after_open_x1_duration_spin = self._make_float_spin(
+                0.5,
+                30.0,
+                self.DEFAULT_PUTBACK2_AFTER_OPEN_X1_DURATION_S,
+                0.5,
+                " s",
+            )
+            self._add_compact_value_row(
+                step15_layout,
+                1,
+                "MoveL时间:",
+                self.putback2_after_open_x1_duration_spin,
+            )
+
+            step16, step16_layout = self._create_step_group("步骤16：闭合-Y+等待-X-全开")
+            layout.addWidget(step16, base_row + 12, 0, 1, 5)
+            self.putback2_combo_close_spin = self._make_float_spin(
+                -30.0,
+                140.0,
+                self.DEFAULT_PUTBACK2_COMBO_CLOSE_DEG,
+                1.0,
+                "°",
+            )
+            self._add_compact_value_row(step16_layout, 0, "闭合角度:", self.putback2_combo_close_spin)
+            self.putback2_combo_close_speed_spin = self._make_float_spin(
+                1.0,
+                60.0,
+                self.DEFAULT_PUTBACK2_COMBO_CLOSE_SPEED_DEG_S,
+                0.5,
+                "°/s",
+            )
+            self._add_compact_value_row(step16_layout, 1, "闭合速度:", self.putback2_combo_close_speed_spin)
+            self.putback2_combo_y_offset_spin = self._make_float_spin(
+                -50.0,
+                50.0,
+                self.DEFAULT_PUTBACK2_COMBO_Y_OFFSET_CM,
+                0.5,
+                " cm",
+            )
+            self._add_compact_value_row(step16_layout, 2, "Y偏移:", self.putback2_combo_y_offset_spin)
+            self.putback2_combo_y_duration_spin = self._make_float_spin(
+                0.5,
+                30.0,
+                self.DEFAULT_PUTBACK2_COMBO_Y_DURATION_S,
+                0.5,
+                " s",
+            )
+            self._add_compact_value_row(step16_layout, 3, "Y MoveL时间:", self.putback2_combo_y_duration_spin)
+            self.putback2_combo_wait_spin = self._make_float_spin(
+                0.0,
+                30.0,
+                self.DEFAULT_PUTBACK2_COMBO_WAIT_S,
+                0.5,
+                " s",
+            )
+            self._add_compact_value_row(step16_layout, 4, "等待时间:", self.putback2_combo_wait_spin)
+            self.putback2_combo_x_offset_spin = self._make_float_spin(
+                -50.0,
+                50.0,
+                self.DEFAULT_PUTBACK2_COMBO_X_OFFSET_CM,
+                0.5,
+                " cm",
+            )
+            self._add_compact_value_row(step16_layout, 5, "X偏移:", self.putback2_combo_x_offset_spin)
+            self.putback2_combo_x_duration_spin = self._make_float_spin(
+                0.5,
+                30.0,
+                self.DEFAULT_PUTBACK2_COMBO_X_DURATION_S,
+                0.5,
+                " s",
+            )
+            self._add_compact_value_row(step16_layout, 6, "X MoveL时间:", self.putback2_combo_x_duration_spin)
+            self.putback2_combo_full_open_spin = self._make_float_spin(
+                -30.0,
+                140.0,
+                self.DEFAULT_PUTBACK2_COMBO_FULL_OPEN_DEG,
+                1.0,
+                "°",
+            )
+            self._add_compact_value_row(step16_layout, 7, "全开角度:", self.putback2_combo_full_open_spin)
+            self.putback2_combo_full_open_speed_spin = self._make_float_spin(
+                1.0,
+                60.0,
+                self.DEFAULT_PUTBACK2_COMBO_FULL_OPEN_SPEED_DEG_S,
+                0.5,
+                "°/s",
+            )
+            self._add_compact_value_row(step16_layout, 8, "全开速度:", self.putback2_combo_full_open_speed_spin)
+
+            step17, step17_layout = self._create_step_group("步骤17：机械臂X+移动")
+            layout.addWidget(step17, base_row + 13, 0, 1, 5)
+            self.putback2_after_combo_x_offset_spin = self._make_float_spin(
+                -50.0,
+                50.0,
+                self.DEFAULT_PUTBACK2_AFTER_COMBO_X_OFFSET_CM,
+                0.5,
+                " cm",
+            )
+            self._add_compact_value_row(
+                step17_layout,
+                0,
+                "X偏移:",
+                self.putback2_after_combo_x_offset_spin,
+            )
+            self.putback2_after_combo_x_duration_spin = self._make_float_spin(
+                0.5,
+                30.0,
+                self.DEFAULT_PUTBACK2_AFTER_COMBO_X_DURATION_S,
+                0.5,
+                " s",
+            )
+            self._add_compact_value_row(
+                step17_layout,
+                1,
+                "MoveL时间:",
+                self.putback2_after_combo_x_duration_spin,
+            )
+            return base_row + 14
 
         step9, step9_layout = self._create_step_group("步骤9：当前位姿偏移IK+MoveJ")
         layout.addWidget(step9, base_row + 5, 0, 1, 5)
@@ -2074,7 +2832,7 @@ class RealSensePointPanel(QWidget):
         if hasattr(self, "template_combo"):
             add("template", self.template_combo)
 
-        if self._workflow_mode == "takeout":
+        if self._is_takeout_based_workflow():
             add_many("target_comp_xyz", getattr(self, "target_comp_xyz_spins", []))
             add_many("pregrasp_offset_xyz", getattr(self, "pregrasp_offset_xyz_spins", []))
             add_many("pregrasp_rpy", getattr(self, "pregrasp_rpy_spins", []))
@@ -2094,24 +2852,113 @@ class RealSensePointPanel(QWidget):
             add("gripper_close_speed", getattr(self, "gripper_close_speed_spin", None))
             add("gripper_kp", getattr(self, "gripper_kp_spin", None))
             add("gripper_kd", getattr(self, "gripper_kd_spin", None))
-            add_many(
-                "post_gripper_movej_xyz",
-                getattr(self, "post_gripper_movej_xyz_spins", []),
-            )
-            add_many(
-                "post_gripper_movej_rpy",
-                getattr(self, "post_gripper_movej_rpy_spins", []),
-            )
-            add(
-                "post_gripper_movej_duration",
-                getattr(self, "post_gripper_movej_duration_spin", None),
-            )
-            add_many("debug_joint", getattr(self, "debug_joint_spins", []))
-            add("flow_debug_duration", getattr(self, "flow_debug_duration_spin", None))
-            add_many("turn_stage1_joint", getattr(self, "turn_stage1_joint_spins", []))
-            add("flow_turn_duration", getattr(self, "flow_turn_duration_spin", None))
-            add_many("final_joint", getattr(self, "final_joint_spins", []))
-            add("flow_final_duration", getattr(self, "flow_final_duration_spin", None))
+            if self._workflow_mode == "putback2":
+                add_many("putback2_reset_rpy", getattr(self, "putback2_reset_rpy_spins", []))
+                add(
+                    "putback2_reset_rpy_duration",
+                    getattr(self, "putback2_reset_rpy_duration_spin", None),
+                )
+                add("putback2_x_offset", getattr(self, "putback2_x_offset_spin", None))
+                add(
+                    "putback2_x_move_duration",
+                    getattr(self, "putback2_x_move_duration_spin", None),
+                )
+                add(
+                    "putback2_gripper_partial_open",
+                    getattr(self, "putback2_gripper_partial_open_spin", None),
+                )
+                add(
+                    "putback2_gripper_partial_open_speed",
+                    getattr(self, "putback2_gripper_partial_open_speed_spin", None),
+                )
+                add(
+                    "putback2_rod_release",
+                    getattr(self, "putback2_rod_release_spin", None),
+                )
+                add("putback2_z_offset", getattr(self, "putback2_z_offset_spin", None))
+                add(
+                    "putback2_z_move_duration",
+                    getattr(self, "putback2_z_move_duration_spin", None),
+                )
+                add(
+                    "putback2_gripper_full_open",
+                    getattr(self, "putback2_gripper_full_open_spin", None),
+                )
+                add(
+                    "putback2_gripper_full_open_speed",
+                    getattr(self, "putback2_gripper_full_open_speed_spin", None),
+                )
+                add(
+                    "putback2_after_open_x1_offset",
+                    getattr(self, "putback2_after_open_x1_offset_spin", None),
+                )
+                add(
+                    "putback2_after_open_x1_duration",
+                    getattr(self, "putback2_after_open_x1_duration_spin", None),
+                )
+                add(
+                    "putback2_combo_close",
+                    getattr(self, "putback2_combo_close_spin", None),
+                )
+                add(
+                    "putback2_combo_close_speed",
+                    getattr(self, "putback2_combo_close_speed_spin", None),
+                )
+                add(
+                    "putback2_combo_y_offset",
+                    getattr(self, "putback2_combo_y_offset_spin", None),
+                )
+                add(
+                    "putback2_combo_y_duration",
+                    getattr(self, "putback2_combo_y_duration_spin", None),
+                )
+                add(
+                    "putback2_combo_wait",
+                    getattr(self, "putback2_combo_wait_spin", None),
+                )
+                add(
+                    "putback2_combo_x_offset",
+                    getattr(self, "putback2_combo_x_offset_spin", None),
+                )
+                add(
+                    "putback2_combo_x_duration",
+                    getattr(self, "putback2_combo_x_duration_spin", None),
+                )
+                add(
+                    "putback2_combo_full_open",
+                    getattr(self, "putback2_combo_full_open_spin", None),
+                )
+                add(
+                    "putback2_combo_full_open_speed",
+                    getattr(self, "putback2_combo_full_open_speed_spin", None),
+                )
+                add(
+                    "putback2_after_combo_x_offset",
+                    getattr(self, "putback2_after_combo_x_offset_spin", None),
+                )
+                add(
+                    "putback2_after_combo_x_duration",
+                    getattr(self, "putback2_after_combo_x_duration_spin", None),
+                )
+            else:
+                add_many(
+                    "post_gripper_movej_xyz",
+                    getattr(self, "post_gripper_movej_xyz_spins", []),
+                )
+                add_many(
+                    "post_gripper_movej_rpy",
+                    getattr(self, "post_gripper_movej_rpy_spins", []),
+                )
+                add(
+                    "post_gripper_movej_duration",
+                    getattr(self, "post_gripper_movej_duration_spin", None),
+                )
+                add_many("debug_joint", getattr(self, "debug_joint_spins", []))
+                add("flow_debug_duration", getattr(self, "flow_debug_duration_spin", None))
+                add_many("turn_stage1_joint", getattr(self, "turn_stage1_joint_spins", []))
+                add("flow_turn_duration", getattr(self, "flow_turn_duration_spin", None))
+                add_many("final_joint", getattr(self, "final_joint_spins", []))
+                add("flow_final_duration", getattr(self, "flow_final_duration_spin", None))
         else:
             add("gripper_open", getattr(self, "gripper_open_spin", None))
             add("gripper_close", getattr(self, "gripper_close_spin", None))
@@ -2183,6 +3030,22 @@ class RealSensePointPanel(QWidget):
         ):
             defaults = dict(defaults)
             defaults["putback_push_base_y"] = defaults["putback_push_right"]
+        if (
+            self._workflow_mode == "putback2"
+            and "putback2_gripper_full_open" not in defaults
+            and "putback2_gripper_open" in defaults
+        ):
+            defaults = dict(defaults)
+            defaults["putback2_gripper_full_open"] = defaults["putback2_gripper_open"]
+        if (
+            self._workflow_mode == "putback2"
+            and "putback2_gripper_full_open_speed" not in defaults
+            and "putback2_gripper_open_speed" in defaults
+        ):
+            defaults = dict(defaults)
+            defaults["putback2_gripper_full_open_speed"] = defaults[
+                "putback2_gripper_open_speed"
+            ]
         for key, value in defaults.items():
             widget = self._workflow_default_controls.get(key)
             if widget is None:
@@ -2489,6 +3352,152 @@ class RealSensePointPanel(QWidget):
             self.flow_detect_btn.setEnabled(True)
         self.capture_btn.setText(tr("pc.capture"))
 
+    def _start_book_spine_segmentation(self):
+        try:
+            if self._segment_worker is not None and self._segment_worker.isRunning():
+                return False
+            if self._depth_max_m <= self._depth_min_m:
+                self._set_error(tr("pc.depth_range_error"))
+                return False
+
+            self._segmentation_result = None
+            self.rgb_preview_label.hide()
+            self.image_detect_btn.setEnabled(False)
+            self.image_detect_btn.setText(tr("pc.image_detecting"))
+            self.image_status_label.setText("准备拍摄并分割书脊...")
+            self._reset_image_recognition_labels()
+
+            self._segment_worker = BookSpineSegmentWorker(
+                serial=self._serial,
+                width=min(self._width, BOOK_SPINE_SEGMENT_CAPTURE_WIDTH),
+                height=min(self._height, BOOK_SPINE_SEGMENT_CAPTURE_HEIGHT),
+                fps=self._fps,
+                warmup=min(self._warmup, BOOK_SPINE_SEGMENT_WARMUP),
+                timeout_ms=self._timeout_ms,
+                align_depth_to_color=self._align_depth_to_color,
+                depth_min_m=self._depth_min_m,
+                depth_max_m=self._depth_max_m,
+                stride=self._stride,
+                include_color=self._include_color,
+                depth_width=min(self._depth_width, BOOK_SPINE_SEGMENT_CAPTURE_DEPTH_WIDTH),
+                depth_height=min(self._depth_height, BOOK_SPINE_SEGMENT_CAPTURE_DEPTH_HEIGHT),
+                parent=self,
+            )
+            self._segment_worker.segmentation_finished.connect(
+                self._on_book_spine_segmentation_finished
+            )
+            self._segment_worker.status_message.connect(
+                self._on_book_spine_segmentation_status
+            )
+            self._segment_worker.error_occurred.connect(
+                self._on_book_spine_segmentation_error
+            )
+            self._segment_worker.finished.connect(
+                self._on_book_spine_segmentation_thread_finished
+            )
+            self._segment_worker.start()
+            return True
+        except Exception as exc:
+            self._on_book_spine_segmentation_error(str(exc))
+            return False
+
+    def _reset_image_recognition_labels(self):
+        if hasattr(self, "segment_preview_label"):
+            self.segment_preview_label.setPixmap(QPixmap())
+            self.segment_preview_label.setText("分割结果预览")
+        if hasattr(self, "segment_count_label"):
+            self.segment_count_label.setText("识别到书脊数量: --")
+        if hasattr(self, "segment_gap_label"):
+            self.segment_gap_label.setText("Step2 最大书缝: --")
+        if hasattr(self, "segment_gap_line_label"):
+            self.segment_gap_line_label.setText("中线像素: --")
+        if hasattr(self, "segment_gap_pixel_label"):
+            self.segment_gap_pixel_label.setText("中线中点像素: --")
+        if hasattr(self, "segment_gap_camera_label"):
+            self.segment_gap_camera_label.setText("中点点云坐标: --")
+        if hasattr(self, "segment_gap_robot_label"):
+            self.segment_gap_robot_label.setText("机械臂末端点坐标: --")
+        if hasattr(self, "segment_output_label"):
+            self.segment_output_label.setText("输出路径: --")
+
+    def _on_book_spine_segmentation_status(self, message: str):
+        if hasattr(self, "image_status_label"):
+            self.image_status_label.setText(message)
+
+    def _on_book_spine_segmentation_error(self, message: str):
+        self._set_error(tr("pc.capture_error", msg=message))
+        if hasattr(self, "image_status_label"):
+            self.image_status_label.setText(f"图片识别失败: {message}")
+
+    def _on_book_spine_segmentation_thread_finished(self):
+        if hasattr(self, "image_detect_btn"):
+            self.image_detect_btn.setEnabled(True)
+            self.image_detect_btn.setText(tr("pc.image_detect"))
+
+    def _on_book_spine_segmentation_finished(self, result: dict):
+        frame = result.get("frame")
+        self._frame = frame
+        self._point_cloud = None
+        self._book_spine_pick = None
+        self._clear_selection()
+        self._segmentation_result = dict(result or {})
+
+        overlay_path = Path(result.get("overlay_path", ""))
+        spine_count = int(result.get("spine_count", 0))
+        gap_result = result.get("gap_result")
+        self._show_segmentation_preview(overlay_path, gap_result=gap_result)
+        if hasattr(self, "segment_count_label"):
+            self.segment_count_label.setText(f"识别到书脊数量: {spine_count}")
+        if isinstance(gap_result, BookGapResult):
+            if hasattr(self, "segment_gap_label"):
+                self.segment_gap_label.setText(
+                    "Step2 最大书缝: "
+                    f"书脊 {gap_result.left_index} 与 {gap_result.right_index} 之间，"
+                    f"平均宽度 {gap_result.gap_width_px:.1f} px"
+                )
+            if hasattr(self, "segment_gap_line_label"):
+                self.segment_gap_line_label.setText(
+                    "中线像素: "
+                    f"({gap_result.line_top_uv[0]}, {gap_result.line_top_uv[1]}) -> "
+                    f"({gap_result.line_bottom_uv[0]}, {gap_result.line_bottom_uv[1]})"
+                )
+            if hasattr(self, "segment_gap_pixel_label"):
+                self.segment_gap_pixel_label.setText(
+                    f"中线中点像素: u={gap_result.midpoint_uv[0]}, v={gap_result.midpoint_uv[1]}"
+                )
+            if hasattr(self, "segment_gap_camera_label"):
+                self.segment_gap_camera_label.setText(
+                    f"中点点云坐标: {_format_vec_m(gap_result.camera_point_m)}"
+                )
+            if hasattr(self, "segment_gap_robot_label"):
+                self.segment_gap_robot_label.setText(
+                    f"机械臂末端点坐标: {_format_vec_cm(gap_result.robot_point_m)}"
+                )
+        else:
+            gap_error = str(result.get("gap_error") or "未找到有效书缝")
+            if hasattr(self, "segment_gap_label"):
+                self.segment_gap_label.setText(f"Step2 最大书缝: 计算失败，{gap_error}")
+            if hasattr(self, "segment_gap_line_label"):
+                self.segment_gap_line_label.setText("中线像素: --")
+            if hasattr(self, "segment_gap_pixel_label"):
+                self.segment_gap_pixel_label.setText("中线中点像素: --")
+            if hasattr(self, "segment_gap_camera_label"):
+                self.segment_gap_camera_label.setText("中点点云坐标: --")
+            if hasattr(self, "segment_gap_robot_label"):
+                self.segment_gap_robot_label.setText("机械臂末端点坐标: --")
+        if hasattr(self, "segment_output_label"):
+            self.segment_output_label.setText(f"输出路径: {overlay_path}")
+        if hasattr(self, "image_status_label"):
+            if isinstance(gap_result, BookGapResult):
+                self.image_status_label.setText("书脊分割和最大书缝计算完成，结果已显示在右侧。")
+            else:
+                self.image_status_label.setText("书脊分割完成，但最大书缝未计算成功。")
+        self.status_label.setText("书脊分割完成")
+        self.log_message.emit(
+            f"书脊分割完成: {spine_count} 个, overlay={overlay_path}, gap={gap_result}"
+        )
+        self._update_move_button_state()
+
     def _display_cloud(self, point_cloud):
         self._ensure_plotter()
         if not HAS_PYVISTA or self._plotter is None:
@@ -2696,6 +3705,73 @@ class RealSensePointPanel(QWidget):
         self.rgb_preview_label.setPixmap(pixmap)
         self.rgb_preview_label.show()
         self._position_rgb_preview()
+
+    def _show_segmentation_preview(
+        self,
+        overlay_path: Path,
+        *,
+        gap_result: Optional[BookGapResult] = None,
+    ):
+        if not hasattr(self, "segment_preview_label"):
+            return
+        display_path = overlay_path
+        if isinstance(gap_result, BookGapResult) and cv2 is not None:
+            image_bgr = cv2.imread(str(overlay_path))
+            if image_bgr is not None:
+                cv2.line(
+                    image_bgr,
+                    gap_result.line_top_uv,
+                    gap_result.line_bottom_uv,
+                    (0, 0, 255),
+                    4,
+                    cv2.LINE_AA,
+                )
+                cv2.circle(
+                    image_bgr,
+                    gap_result.midpoint_uv,
+                    9,
+                    (0, 255, 255),
+                    -1,
+                    cv2.LINE_AA,
+                )
+                cv2.circle(
+                    image_bgr,
+                    gap_result.midpoint_uv,
+                    12,
+                    (0, 0, 255),
+                    3,
+                    cv2.LINE_AA,
+                )
+                cv2.putText(
+                    image_bgr,
+                    "MAX GAP",
+                    (
+                        max(0, gap_result.midpoint_uv[0] + 12),
+                        max(22, gap_result.midpoint_uv[1] - 12),
+                    ),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.7,
+                    (0, 0, 255),
+                    2,
+                    cv2.LINE_AA,
+                )
+                annotated_path = overlay_path.with_name(
+                    f"{overlay_path.stem}_max_gap{overlay_path.suffix}"
+                )
+                cv2.imwrite(str(annotated_path), image_bgr)
+                display_path = annotated_path
+                if isinstance(self._segmentation_result, dict):
+                    self._segmentation_result["annotated_overlay_path"] = annotated_path
+        pixmap = QPixmap(str(display_path))
+        if pixmap.isNull():
+            self.segment_preview_label.setText(f"无法加载分割结果图: {display_path}")
+            return
+        pixmap = pixmap.scaled(
+            self.segment_preview_label.size(),
+            Qt.AspectRatioMode.KeepAspectRatio,
+            Qt.TransformationMode.SmoothTransformation,
+        )
+        self.segment_preview_label.setPixmap(pixmap)
 
     def _show_tail_putback_target_preview(
         self,
@@ -3163,6 +4239,12 @@ class RealSensePointPanel(QWidget):
     def _is_putback_workflow(self) -> bool:
         return _is_putback_workflow_mode(self._workflow_mode)
 
+    def _is_takeout_based_workflow(self) -> bool:
+        return _is_takeout_based_workflow_mode(self._workflow_mode)
+
+    def _is_image_recognition_workflow(self) -> bool:
+        return _is_image_recognition_workflow_mode(self._workflow_mode)
+
     def _putback_target_line(self) -> str:
         combo = getattr(self, "putback_target_line_combo", None)
         if combo is None:
@@ -3188,23 +4270,27 @@ class RealSensePointPanel(QWidget):
             return 0.75
 
     def _workflow_group_title(self) -> str:
+        if self._workflow_mode == "image_recognition":
+            return tr("pc.image_recognition_group")
         if self._workflow_mode == "tail_putback":
             return tr("pc.book_tail_putback_group")
         if self._workflow_mode == "putback":
             return tr("pc.book_putback_group")
+        if self._workflow_mode == "putback2":
+            return tr("pc.book_putback2_group")
         return tr("pc.book_takeout_group")
 
     def _current_workflow_target_rpy_deg(self) -> list[float]:
         if self._is_putback_workflow() and hasattr(self, "putback_target_rpy_spins"):
             return self._spin_values(self.putback_target_rpy_spins)
-        if self._workflow_mode == "takeout" and hasattr(self, "grasp_rpy_spins"):
+        if self._is_takeout_based_workflow() and hasattr(self, "grasp_rpy_spins"):
             return self._spin_values(self.grasp_rpy_spins)
         return self._spin_values(self.rpy_spins)
 
     def _current_target_compensation_cm(self) -> list[float]:
         if self._is_putback_workflow() and hasattr(self, "putback_target_comp_xyz_spins"):
             return self._spin_values(self.putback_target_comp_xyz_spins)
-        if self._workflow_mode == "takeout" and hasattr(self, "target_comp_xyz_spins"):
+        if self._is_takeout_based_workflow() and hasattr(self, "target_comp_xyz_spins"):
             return self._spin_values(self.target_comp_xyz_spins)
         return [0.0, 0.0, 0.0]
 
@@ -3237,6 +4323,8 @@ class RealSensePointPanel(QWidget):
     def _flow_log_prefix(self) -> str:
         if self._workflow_mode == "tail_putback":
             return "书籍末尾放回流程"
+        if self._workflow_mode == "putback2":
+            return "书籍放回2流程"
         return "书籍放回流程" if self._workflow_mode == "putback" else "书籍取出流程"
 
     def _book_grasp_steps(self) -> list[str]:
@@ -3263,6 +4351,26 @@ class RealSensePointPanel(QWidget):
                 "打开夹爪到指定角度",
                 "MoveL 沿当前位姿 X+ 离开插入位",
                 "MoveJ 回到调试位",
+            ]
+        if self._workflow_mode == "putback2":
+            return [
+                "采集点云",
+                "识别书籍",
+                "解算目标点",
+                "到达预备抓取位姿",
+                "到达抓取位姿",
+                "杆电机到夹取位",
+                "微调抓取位姿",
+                "夹爪带监测持续关闭",
+                "将末端姿态改为默认 RPY",
+                "沿基坐标系 X+ 移动",
+                "夹爪开一点",
+                "杆电机运动到 90 度",
+                "机械臂沿基坐标系 Z- 移动",
+                "夹爪全部张开",
+                "机械臂沿基坐标系 X+ 移动",
+                "夹爪闭合、Y+移动、等待、X-移动、夹爪全开",
+                "机械臂沿基坐标系 X+ 移动",
             ]
         return [
             "采集点云",
@@ -3363,13 +4471,35 @@ class RealSensePointPanel(QWidget):
         elif step == 7:
             self._start_monitored_gripper_close()
         elif step == 8:
-            self._execute_post_gripper_movej_offset_step()
+            if self._workflow_mode == "putback2":
+                self._execute_putback2_reset_rpy_step()
+            else:
+                self._execute_post_gripper_movej_offset_step()
         elif step == 9:
-            self._execute_return_debug_step()
+            if self._workflow_mode == "putback2":
+                self._execute_putback2_x_offset_step()
+            else:
+                self._execute_return_debug_step()
         elif step == 10:
-            self._execute_turn_stage1_step()
+            if self._workflow_mode == "putback2":
+                self._start_putback2_gripper_open(partial=True)
+            else:
+                self._execute_turn_stage1_step()
         elif step == 11:
-            self._execute_final_joint_step()
+            if self._workflow_mode == "putback2":
+                self._write_rod_and_wait(self.putback2_rod_release_spin.value())
+            else:
+                self._execute_final_joint_step()
+        elif step == 12 and self._workflow_mode == "putback2":
+            self._execute_putback2_z_offset_step()
+        elif step == 13 and self._workflow_mode == "putback2":
+            self._start_putback2_gripper_open(partial=False)
+        elif step == 14 and self._workflow_mode == "putback2":
+            self._execute_putback2_after_open_x1_step()
+        elif step == 15 and self._workflow_mode == "putback2":
+            self._start_putback2_combo_step()
+        elif step == 16 and self._workflow_mode == "putback2":
+            self._execute_putback2_after_combo_x_step()
 
     def _execute_putback_motion_step(self, step: int):
         if step == 3:
@@ -3619,6 +4749,148 @@ class RealSensePointPanel(QWidget):
             duration=float(self.post_gripper_movej_duration_spin.value()),
         )
 
+    def _execute_putback2_reset_rpy_step(self):
+        rpy_deg = self._spin_values(self.putback2_reset_rpy_spins)
+        pose = self._make_pose_from_current_end_pose(
+            rpy_deg=rpy_deg,
+            prefer_last_flow_pose=True,
+        )
+        if pose is None:
+            self._set_error("暂无末端位姿，无法执行姿态恢复")
+            return
+        self._send_blocking_end_pose(
+            pose,
+            (
+                "等待机械臂保持当前位置并将末端姿态改为 "
+                f"RPY=[{rpy_deg[0]:.2f}, {rpy_deg[1]:.2f}, {rpy_deg[2]:.2f}]°"
+            ),
+            duration=float(self.putback2_reset_rpy_duration_spin.value()),
+        )
+
+    def _execute_putback2_x_offset_step(self):
+        x_offset = float(self.putback2_x_offset_spin.value())
+        self._execute_putback2_base_x_offset(
+            x_offset,
+            float(self.putback2_x_move_duration_spin.value()),
+        )
+
+    def _execute_putback2_base_x_offset(self, x_offset: float, duration: float):
+        pose = self._make_pose_from_current_end_pose(
+            x_offset_cm=float(x_offset),
+            local_axes=False,
+            prefer_last_flow_pose=True,
+        )
+        if pose is None:
+            self._set_error("暂无末端位姿，无法沿基坐标系 X+ 移动")
+            return
+        self._send_blocking_movel(
+            pose,
+            f"等待机械臂沿基坐标系 X MoveL 移动 {float(x_offset):.2f}cm",
+            duration=float(duration),
+        )
+
+    def _execute_putback2_z_offset_step(self):
+        z_offset = float(self.putback2_z_offset_spin.value())
+        pose = self._make_pose_from_current_end_pose(
+            z_offset_cm=z_offset,
+            local_axes=False,
+            prefer_last_flow_pose=True,
+        )
+        if pose is None:
+            self._set_error("暂无末端位姿，无法沿基坐标系 Z 移动")
+            return
+        self._send_blocking_movel(
+            pose,
+            f"等待机械臂沿基坐标系 Z MoveL 移动 {z_offset:.2f}cm",
+            duration=float(self.putback2_z_move_duration_spin.value()),
+        )
+
+    def _execute_putback2_after_open_x1_step(self):
+        self._execute_putback2_base_x_offset(
+            float(self.putback2_after_open_x1_offset_spin.value()),
+            float(self.putback2_after_open_x1_duration_spin.value()),
+        )
+
+    def _execute_putback2_after_combo_x_step(self):
+        self._execute_putback2_base_x_offset(
+            float(self.putback2_after_combo_x_offset_spin.value()),
+            float(self.putback2_after_combo_x_duration_spin.value()),
+        )
+
+    def _start_putback2_combo_step(self):
+        self._start_putback2_gripper_move(
+            target_deg=float(self.putback2_combo_close_spin.value()),
+            speed_deg_s=float(self.putback2_combo_close_speed_spin.value()),
+            waiting_kind="putback2_combo_close",
+            waiting_text=f"步骤16：等待夹爪闭合到 {self.putback2_combo_close_spin.value():.1f}°",
+            effort=float(self.gripper_effort_spin.value()),
+        )
+
+    def _execute_putback2_combo_y_move(self):
+        y_offset = float(self.putback2_combo_y_offset_spin.value())
+        pose = self._make_pose_from_current_end_pose(
+            y_offset_cm=y_offset,
+            local_axes=False,
+            prefer_last_flow_pose=True,
+        )
+        if pose is None:
+            self._set_error("暂无末端位姿，无法执行步骤16的 Y 移动")
+            return
+        self._send_blocking_movel(
+            pose,
+            f"步骤16：等待机械臂沿基坐标系 Y MoveL 移动 {y_offset:.2f}cm",
+            duration=float(self.putback2_combo_y_duration_spin.value()),
+        )
+        self._flow_waiting_kind = "putback2_combo_y_move"
+
+    def _begin_putback2_combo_wait(self):
+        wait_s = max(0.0, float(self.putback2_combo_wait_spin.value()))
+        self._flow_waiting_motion = True
+        self._flow_waiting_kind = "putback2_combo_wait"
+        self._flow_pending_pose = None
+        self._update_flow_button_state()
+        self.flow_status_label.setText(f"步骤16：等待 {wait_s:.1f}s 后执行 X 移动")
+        QTimer.singleShot(int(wait_s * 1000), self._finish_putback2_combo_wait)
+
+    def _finish_putback2_combo_wait(self):
+        if (
+            self._workflow_mode != "putback2"
+            or not self._flow_active
+            or not self._flow_waiting_motion
+            or self._flow_waiting_kind != "putback2_combo_wait"
+        ):
+            return
+        self._execute_putback2_combo_x_move()
+
+    def _execute_putback2_combo_x_move(self):
+        x_offset = float(self.putback2_combo_x_offset_spin.value())
+        pose = self._make_pose_from_current_end_pose(
+            x_offset_cm=x_offset,
+            local_axes=False,
+            prefer_last_flow_pose=True,
+        )
+        if pose is None:
+            self._set_error("暂无末端位姿，无法执行步骤16的 X 移动")
+            return
+        self._send_blocking_movel(
+            pose,
+            f"步骤16：等待机械臂沿基坐标系 X MoveL 移动 {x_offset:.2f}cm",
+            duration=float(self.putback2_combo_x_duration_spin.value()),
+        )
+        self._flow_waiting_kind = "putback2_combo_x_move"
+
+    def _finish_putback2_combo_with_full_open(self):
+        self._start_putback2_gripper_move(
+            target_deg=float(self.putback2_combo_full_open_spin.value()),
+            speed_deg_s=float(self.putback2_combo_full_open_speed_spin.value()),
+            waiting_kind="putback2_combo_full_open",
+            waiting_text=(
+                "步骤16：等待夹爪全部张开到 "
+                f"{self.putback2_combo_full_open_spin.value():.1f}°"
+            ),
+            effort=0.0,
+        )
+
     def _execute_return_debug_step(self):
         joints = self._joint_spins_to_radians(self.debug_joint_spins)
         self._record_previous_flow_pose()
@@ -3720,6 +4992,11 @@ class RealSensePointPanel(QWidget):
         self.move_j_block_requested.emit(joints, duration)
 
     def _manual_gripper_open_target_angle_deg(self) -> float:
+        if self._workflow_mode == "putback2":
+            if hasattr(self, "putback2_gripper_full_open_spin"):
+                return float(self.putback2_gripper_full_open_spin.value())
+            if hasattr(self, "putback2_gripper_partial_open_spin"):
+                return float(self.putback2_gripper_partial_open_spin.value())
         if self._is_putback_workflow() and hasattr(self, "putback_gripper_open_spin"):
             return float(self.putback_gripper_open_spin.value())
         if hasattr(self, "gripper_open_spin"):
@@ -4013,6 +5290,75 @@ class RealSensePointPanel(QWidget):
             }
         )
 
+    def _start_putback2_gripper_open(self, *, partial: bool):
+        if partial:
+            target_deg = float(self.putback2_gripper_partial_open_spin.value())
+            speed_deg_s = float(self.putback2_gripper_partial_open_speed_spin.value())
+            waiting_text = f"等待夹爪开一点到 {target_deg:.1f}°"
+        else:
+            target_deg = float(self.putback2_gripper_full_open_spin.value())
+            speed_deg_s = float(self.putback2_gripper_full_open_speed_spin.value())
+            waiting_text = f"等待夹爪全部张开到 {target_deg:.1f}°"
+        self._start_putback2_gripper_move(
+            target_deg=target_deg,
+            speed_deg_s=speed_deg_s,
+            waiting_kind="putback2_gripper_open",
+            waiting_text=waiting_text,
+            effort=0.0,
+        )
+
+    def _start_putback2_gripper_move(
+        self,
+        *,
+        target_deg: float,
+        speed_deg_s: float,
+        waiting_kind: str,
+        waiting_text: str,
+        effort: float,
+    ):
+        target_deg = float(target_deg)
+        speed_deg_s = max(0.1, float(speed_deg_s))
+        effort = float(effort)
+        self._flow_waiting_motion = True
+        self._flow_waiting_kind = str(waiting_kind)
+        self._flow_rollback_waiting = False
+        self._flow_pending_pose = None
+        self._manual_gripper_open_target_deg = target_deg
+        self._gripper_close_target_deg = target_deg
+        self._gripper_close_effort_nm = effort
+        self._gripper_close_started_at_s = time.monotonic()
+        self._gripper_close_last_cmd_s = 0.0
+        self._gripper_close_last_cmd_deg = None
+        self._gripper_close_last_angle_deg = None
+        self._gripper_close_stable_since_s = None
+        self._update_flow_button_state()
+        self.flow_status_label.setText(waiting_text)
+        self.gripper_close_monitor_requested.emit(
+            {
+                "target_angle": math.radians(target_deg),
+                "close_speed": math.radians(speed_deg_s),
+                "effort": effort,
+                "kp": (
+                    float(self.gripper_kp_spin.value())
+                    if effort > 0.0 and hasattr(self, "gripper_kp_spin")
+                    else 0.0
+                ),
+                "kd": (
+                    float(self.gripper_kd_spin.value())
+                    if effort > 0.0 and hasattr(self, "gripper_kd_spin")
+                    else 0.0
+                ),
+                "timeout_s": float(self.GRIPPER_CLOSE_TIMEOUT_S),
+                "monitor_period_s": 0.05,
+                "target_tolerance": math.radians(self.GRIPPER_CLOSE_TOLERANCE_DEG),
+                "stall_tolerance": math.radians(self.GRIPPER_CLOSE_STALL_TOLERANCE_DEG),
+                "stall_time_s": float(self.GRIPPER_CLOSE_STALL_S),
+                "min_monitor_s": float(self.GRIPPER_CLOSE_MIN_MONITOR_S),
+                "hold_margin": math.radians(0.5),
+                "command_lead_s": float(self.GRIPPER_CLOSE_COMMAND_LEAD_S),
+            }
+        )
+
     def update_joint_feedback(self, joint_states):
         try:
             positions = joint_states.to_list(include_gripper=True)
@@ -4026,6 +5372,9 @@ class RealSensePointPanel(QWidget):
             "gripper_close",
             "manual_gripper_close",
             "manual_gripper_open",
+            "putback2_gripper_open",
+            "putback2_combo_close",
+            "putback2_combo_full_open",
         }:
             return
         if not self._flow_waiting_motion:
@@ -4040,15 +5389,19 @@ class RealSensePointPanel(QWidget):
         self._current_gripper_angle_deg = final_deg
         self._clear_gripper_close_monitor()
         self._clear_manual_gripper_open()
-        if self._flow_waiting_kind == "manual_gripper_open":
+        if self._flow_waiting_kind in {
+            "manual_gripper_open",
+            "putback2_gripper_open",
+            "putback2_combo_full_open",
+        }:
             if reason == "target_reached":
-                message = f"夹爪已缓慢打开到目标附近：{final_deg:.1f}°"
+                message = f"夹爪已缓慢张开到目标附近：{final_deg:.1f}°"
             elif reason == "stalled":
-                message = f"夹爪打开检测到阻力/卡滞趋势，已锁定保持角度：{command_deg:.1f}°"
+                message = f"夹爪张开检测到阻力/卡滞趋势，已锁定保持角度：{command_deg:.1f}°"
             elif reason == "timeout":
-                message = f"夹爪打开监测超时，已锁定保持角度：{command_deg:.1f}°"
+                message = f"夹爪张开监测超时，已锁定保持角度：{command_deg:.1f}°"
             else:
-                message = f"夹爪缓慢打开完成，保持角度：{command_deg:.1f}°"
+                message = f"夹爪缓慢张开完成，保持角度：{command_deg:.1f}°"
         elif reason == "target_reached":
             message = f"夹爪已关闭到目标附近：{final_deg:.1f}°"
         elif reason == "stalled":
@@ -4064,6 +5417,8 @@ class RealSensePointPanel(QWidget):
             self._flow_pending_pose = None
             self.flow_status_label.setText(message)
             self._update_flow_button_state()
+        elif self._flow_waiting_kind == "putback2_combo_close":
+            self._execute_putback2_combo_y_move()
         else:
             self._advance_book_grasp_flow(message)
 
@@ -4143,10 +5498,31 @@ class RealSensePointPanel(QWidget):
         self._flow_pending_pose = None
 
     def notify_move_l_done(self):
-        if self._flow_waiting_kind not in {None, "move_l"}:
+        if self._flow_waiting_kind not in {
+            None,
+            "move_l",
+            "putback2_combo_y_move",
+            "putback2_combo_x_move",
+        }:
             return
         if self._flow_active and self._flow_waiting_motion:
             self._promote_pending_flow_pose()
+        if (
+            self._workflow_mode == "putback2"
+            and self._flow_active
+            and self._flow_waiting_motion
+            and self._flow_waiting_kind == "putback2_combo_y_move"
+        ):
+            self._begin_putback2_combo_wait()
+            return
+        if (
+            self._workflow_mode == "putback2"
+            and self._flow_active
+            and self._flow_waiting_motion
+            and self._flow_waiting_kind == "putback2_combo_x_move"
+        ):
+            self._finish_putback2_combo_with_full_open()
+            return
         if self._flow_active and self._flow_rollback_waiting:
             self._flow_waiting_motion = False
             self._flow_waiting_kind = None
@@ -4187,22 +5563,20 @@ class RealSensePointPanel(QWidget):
 
     def notify_rod_write_done(self):
         if (
-            self._workflow_mode == "takeout"
+            self._is_takeout_based_workflow()
             and self._flow_active
             and self._flow_waiting_motion
             and self._flow_waiting_kind == "rod"
-            and self._flow_step_index == 5
         ):
-            self.flow_status_label.setText("杆电机夹取位命令已发送，等待到位")
+            self.flow_status_label.setText("杆电机动作命令已发送，等待到位")
 
     def notify_rod_angle_updated(self, angle_deg: float):
         self._rod_current_angle_deg = float(angle_deg)
         if (
-            self._workflow_mode == "takeout"
+            self._is_takeout_based_workflow()
             and self._flow_active
             and self._flow_waiting_motion
             and self._flow_waiting_kind == "rod"
-            and self._flow_step_index == 5
             and self._rod_target_angle_deg is not None
             and abs(self._rod_current_angle_deg - self._rod_target_angle_deg)
             <= self._rod_wait_tolerance_deg
@@ -4299,6 +5673,7 @@ class RealSensePointPanel(QWidget):
             self._selected_robot_target_raw_m = None
             self._target_robot_point_m = None
             self._tail_putback_bottom_point_m = None
+            self._segmentation_result = None
             self.pixel_value.setText("--")
             self.move_target_point_cm_value.setText("--")
             self.target_point_cm_value.setText("--")
@@ -4343,12 +5718,19 @@ class RealSensePointPanel(QWidget):
         self.pick_mode_btn.setText(tr("pc.pick_mode"))
         self.capture_btn.setText(tr("pc.capture"))
         self.book_group.setTitle(tr("pc.book_group"))
+        if hasattr(self, "image_recognition_group"):
+            self.image_recognition_group.setTitle(tr("pc.image_recognition_group"))
+        if hasattr(self, "image_detect_btn"):
+            self.image_detect_btn.setText(tr("pc.image_detect"))
+        if hasattr(self, "image_status_label") and self._segmentation_result is None:
+            self.image_status_label.setText(tr("pc.image_ready"))
         if hasattr(self, "grasp_group"):
             self.grasp_group.setTitle(self._workflow_group_title())
-        for idx, (label, path) in enumerate(BOOK_TEMPLATE_OPTIONS):
-            if idx < self.template_combo.count():
-                self.template_combo.setItemText(idx, label)
-                self.template_combo.setItemData(idx, str(path))
+        if hasattr(self, "template_combo"):
+            for idx, (label, path) in enumerate(BOOK_TEMPLATE_OPTIONS):
+                if idx < self.template_combo.count():
+                    self.template_combo.setItemText(idx, label)
+                    self.template_combo.setItemData(idx, str(path))
         if hasattr(self, "flow_detect_btn"):
             self.flow_detect_btn.setText(tr("pc.workflow_detect"))
         if hasattr(self, "flow_steps_btn"):
@@ -4466,6 +5848,9 @@ class RealSensePointPanel(QWidget):
         if self._detect_worker is not None and self._detect_worker.isRunning():
             self._detect_worker.requestInterruption()
             self._detect_worker.wait(1500)
+        if self._segment_worker is not None and self._segment_worker.isRunning():
+            self._segment_worker.requestInterruption()
+            self._segment_worker.wait(1500)
 
 
 __all__ = [
