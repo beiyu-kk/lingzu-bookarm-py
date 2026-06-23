@@ -21,3 +21,11 @@ Thumbs.db
 # 临时文件
 *.tmp
 *.bak
+
+# 大文件/本地数据
+*.zip
+*.pt
+*.pth
+*.onnx
+book_spine_inference_light/weights/
+recordings/
