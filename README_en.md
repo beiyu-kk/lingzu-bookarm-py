@@ -126,6 +126,15 @@ ls -l /dev/rodmotor
 
 After replacing the USB-to-serial device, if `/dev/rodmotor` does not appear, check the new device with `ls -l /dev/serial/by-id/`, update `idVendor`, `idProduct`, or `serial` in `resources/udev/99-rodmotor.rules`, then rerun the install script and replug the device.
 
+If you use the lift platform, install the fixed serial alias rule as well. MotorStudio connects to the lift platform through `/dev/lift_port` by default:
+
+```bash
+sudo bash scripts/lift_platform/install_lift_platform_udev.sh
+ls -l /dev/lift_port
+```
+
+The current lift platform USB-to-serial adapter enumerates as CH340 `/dev/ttyUSB0` and has no unique serial number, so `resources/udev/99-lift-platform.rules` pins the alias by the current USB physical path. After replugging the lift platform adapter, if `/dev/lift_port` does not appear, run `udevadm info -q property -n /dev/ttyUSB0` to check the new `ID_PATH`, then update `KERNELS=="3-2.2"` in the rule.
+
 ### 3. Install MotorStudio GUI (Optional)
 
 MotorStudio provides a PyQt6-based GUI featuring 3D URDF visualization powered by **PyVista** (VTK), point-cloud picking, interactive joint drag control, and real-time monitoring.

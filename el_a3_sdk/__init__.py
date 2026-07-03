@@ -10,6 +10,15 @@ from el_a3_sdk.data_types import (
     TrajectoryResult,
 )
 from el_a3_sdk.rodmotor import RodMotorClient
+from el_a3_sdk.lift_platform import (
+    DEFAULT_LIFT_ACCELERATION,
+    DEFAULT_LIFT_BAUDRATE,
+    DEFAULT_LIFT_PORT,
+    DEFAULT_LIFT_PULSES_PER_CM,
+    DEFAULT_LIFT_SLAVE_ID,
+    DEFAULT_LIFT_SPEED_RPM,
+    LiftPlatformActuator,
+)
 from el_a3_sdk.protocol import (
     MotorType,
     RunMode,
@@ -132,4 +141,11 @@ __all__ = [
     "SelectedPoint",
     "SelectedTarget",
     "RodMotorClient",
+    "LiftPlatformActuator",
+    "DEFAULT_LIFT_ACCELERATION",
+    "DEFAULT_LIFT_BAUDRATE",
+    "DEFAULT_LIFT_PORT",
+    "DEFAULT_LIFT_PULSES_PER_CM",
+    "DEFAULT_LIFT_SLAVE_ID",
+    "DEFAULT_LIFT_SPEED_RPM",
 ]

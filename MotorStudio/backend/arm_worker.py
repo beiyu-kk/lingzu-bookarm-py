@@ -169,6 +169,10 @@ class ArmWorker(QThread):
             self._do_read_param(*args)
         elif cmd == "write_motor_param":
             self._do_write_param(*args)
+        elif cmd == "set_joint_pd":
+            self._do_set_joint_pd(*args)
+        elif cmd == "set_all_joint_pd":
+            self._do_set_all_joint_pd(*args)
         elif cmd == "start_control_loop":
             self._do_start_control_loop(*args)
         elif cmd == "stop_control_loop":
@@ -494,6 +498,35 @@ class ArmWorker(QThread):
             self._ensure_control_loop()
             self.arm.GripperCtrl(angle, gripper_effort=effort, kp=kp or None, kd=kd or None)
 
+    def _do_set_joint_pd(self, motor_id, kp, kd):
+        motor_id = int(motor_id)
+        kp = float(kp)
+        kd = float(kd)
+        if self._sim_mode:
+            self.log_message.emit(f"关节{motor_id} PD 已设置（模拟）Kp={kp:.1f}, Kd={kd:.2f}")
+            return
+        if not self.arm:
+            self.error_occurred.emit("机械臂未连接，无法设置 PD")
+            return
+        self.arm.SetJointPD(motor_id, kp, kd)
+        self.log_message.emit(f"关节{motor_id} PD 已设置 Kp={kp:.1f}, Kd={kd:.2f}")
+
+    def _do_set_all_joint_pd(self, values):
+        kp_map = {}
+        kd_map = {}
+        for item in values:
+            motor_id, kp, kd = item
+            kp_map[int(motor_id)] = float(kp)
+            kd_map[int(motor_id)] = float(kd)
+        if self._sim_mode:
+            self.log_message.emit(f"关节 PD 已批量设置（模拟）: {values}")
+            return
+        if not self.arm:
+            self.error_occurred.emit("机械臂未连接，无法批量设置 PD")
+            return
+        self.arm.SetAllJointPD(kp_map, kd_map)
+        self.log_message.emit(f"关节 PD 已批量设置: Kp={kp_map}, Kd={kd_map}")
+
     def _do_gripper_close_monitor(
         self,
         target_angle,
@@ -509,6 +542,7 @@ class ArmWorker(QThread):
         min_monitor_s=0.35,
         hold_margin=0.009,
         command_lead_s=0.25,
+        stall_lead_threshold_min=0.0,
         start_effort=None,
         start_boost_s=0.8,
     ):
@@ -543,6 +577,7 @@ class ArmWorker(QThread):
             min_monitor_s=float(min_monitor_s),
             hold_margin=float(hold_margin),
             command_lead_s=float(command_lead_s),
+            stall_lead_threshold_min=float(stall_lead_threshold_min),
             start_effort=float(start_effort) if start_effort is not None else None,
             start_boost_s=float(start_boost_s),
         )

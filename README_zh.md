@@ -123,6 +123,15 @@ ls -l /dev/rodmotor
 
 更换 USB 转串口设备后，如果 `/dev/rodmotor` 没有出现，请先用 `ls -l /dev/serial/by-id/` 查看新设备信息，并同步修改 `resources/udev/99-rodmotor.rules` 中的 `idVendor`、`idProduct` 或 `serial`，然后重新运行安装脚本并重新插拔设备。
 
+如果使用升降台，请安装固定串口别名规则。MotorStudio 默认通过 `/dev/lift_port` 连接升降台：
+
+```bash
+sudo bash scripts/lift_platform/install_lift_platform_udev.sh
+ls -l /dev/lift_port
+```
+
+当前升降台 USB 转串口识别为 CH340 `/dev/ttyUSB0`，且设备本身没有唯一 serial，因此 `resources/udev/99-lift-platform.rules` 按当前 USB 物理路径固定别名。重新插拔升降台 USB 转串口后，如果 `/dev/lift_port` 没有出现，请用 `udevadm info -q property -n /dev/ttyUSB0` 查看新的 `ID_PATH`，并同步修改规则中的 `KERNELS=="3-2.2"`。
+
 ### 3. 安装 MotorStudio 上位机（可选）
 
 MotorStudio 提供 PyQt6 GUI 界面，内含基于 **PyVista** (VTK) 的 3D URDF 可视化、点云选点、关节拖拽控制、实时监控等功能。

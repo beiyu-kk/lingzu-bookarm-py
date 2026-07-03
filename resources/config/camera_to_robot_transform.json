@@ -1,8 +1,8 @@
 {
   "description": "MotorStudio RealSense D435 camera-to-robot-base extrinsic. Formula: p_B = T_B_C @ p_C.",
   "matrix": [
-    [0.0, 0.0, -1.0, 0.03],
-    [1.0, 0.0, 0.0, -0.28],
+    [0.0, 0.0, -1.0, 0.15],
+    [1.0, 0.0, 0.0, -0.29],
     [0.0, -1.0, 0.0, 0.17],
     [0.0, 0.0, 0.0, 1.0]
   ]

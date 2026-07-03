@@ -10,15 +10,20 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtCore import Qt, QTimer, pyqtSignal
 
 from MotorStudio.backend.arm_worker import ArmWorker
+from MotorStudio.backend.lift_platform_worker import LiftPlatformWorker
 from MotorStudio.backend.rodmotor_worker import RodMotorWorker
 from MotorStudio.widgets.toolbar_panel import ToolbarPanel
 from MotorStudio.widgets.joint_control_panel import JointControlPanel
+from MotorStudio.widgets.motor_pd_panel import MotorPDPanel
 from MotorStudio.widgets.monitoring_window import MonitoringWindow
 from MotorStudio.widgets.trajectory_panel import TrajectoryPanel
 from MotorStudio.widgets.tcp_panel import TcpPanel
 from MotorStudio.widgets.teaching_panel import TeachingPanel
 from MotorStudio.widgets.diagnostics_panel import DiagnosticsPanel
+from MotorStudio.widgets.book_debug_pose_panel import BookDebugPosePanel
+from MotorStudio.widgets.book_gripper_panel import BookGripperPanel
 from MotorStudio.widgets.gripper_panel import GripperPanel
+from MotorStudio.widgets.lift_platform_panel import LiftPlatformPanel
 from MotorStudio.widgets.rodmotor_panel import RodMotorPanel
 from MotorStudio.widgets.gamepad_panel import GamepadPanel
 from MotorStudio.widgets.realsense_point_panel import RealSensePointPanel
@@ -40,6 +45,7 @@ class MultiRowPanelTabs(QWidget):
     def __init__(self, parent=None, columns: int = 5):
         super().__init__(parent)
         self._columns = max(1, int(columns))
+        self._category_columns: dict[str, int] = {}
         self._buttons: list[QPushButton] = []
         self._pages: list[QWidget] = []
         self._categories: list[str] = []
@@ -117,6 +123,10 @@ class MultiRowPanelTabs(QWidget):
         if 0 <= index < len(self._buttons):
             self._buttons[index].setText(text)
 
+    def setCategoryColumns(self, category: str, columns: int):
+        self._category_columns[self._normalize_category(category)] = max(1, int(columns))
+        self._rebuild_nav_layout()
+
     def setCategory(self, category: str):
         category = self._normalize_category(category)
         changed = category != self._active_category
@@ -145,16 +155,17 @@ class MultiRowPanelTabs(QWidget):
         while self._nav_layout.count():
             self._nav_layout.takeAt(0)
         visible_index = 0
+        columns = self._category_columns.get(self._active_category, self._columns)
         for index, button in enumerate(self._buttons):
             visible = self._categories[index] == self._active_category
             button.setVisible(visible)
             if not visible:
                 continue
-            row = visible_index // self._columns
-            col = visible_index % self._columns
+            row = visible_index // columns
+            col = visible_index % columns
             self._nav_layout.addWidget(button, row, col)
             visible_index += 1
-        for c in range(self._columns):
+        for c in range(max(self._columns, columns)):
             self._nav_layout.setColumnStretch(c, 1)
 
 
@@ -188,6 +199,7 @@ class MainWindow(QMainWindow):
         )
         tm.theme_changed.connect(lambda _: self.diagnostics_panel.retranslate_ui())
         tm.theme_changed.connect(lambda _: self.gripper_panel.retranslate_ui())
+        tm.theme_changed.connect(lambda _: self.lift_platform_panel.retranslate_ui())
         tm.theme_changed.connect(lambda _: self.rodmotor_panel.retranslate_ui())
         tm.theme_changed.connect(lambda _: self.gamepad_panel.retranslate_ui())
         tm.theme_changed.connect(lambda _: self.tcp_panel.retranslate_ui())
@@ -206,6 +218,8 @@ class MainWindow(QMainWindow):
         self.worker.start()
         self.rodmotor_worker = RodMotorWorker()
         self.rodmotor_worker.start()
+        self.lift_platform_worker = LiftPlatformWorker()
+        self.lift_platform_worker.start()
 
     def _init_ui(self):
         # --- 顶部工具栏（单行固定高度） ---
@@ -236,9 +250,13 @@ class MainWindow(QMainWindow):
 
         # --- 右侧：功能面板导航 ---
         self.tabs = MultiRowPanelTabs(columns=5)
+        self.tabs.setCategoryColumns(MultiRowPanelTabs.LIBRARY_CATEGORY, 4)
 
         self.joint_panel = JointControlPanel()
         self.tabs.addTab(self.joint_panel, tr("tab.joint"))
+
+        self.motor_pd_panel = MotorPDPanel()
+        self.tabs.addTab(self.motor_pd_panel, tr("tab.motor_pd"))
 
         self.trajectory_panel = TrajectoryPanel()
         self.tabs.addTab(self.trajectory_panel, tr("tab.trajectory"))
@@ -246,6 +264,36 @@ class MainWindow(QMainWindow):
         self.tcp_panel = TcpPanel()
         self.tabs.addTab(self.tcp_panel, tr("tab.tcp"))
         self.viewer_3d.set_tcp_offset(self.tcp_panel.get_tcp_offset())
+
+        self.lift_platform_panel = LiftPlatformPanel()
+        self.tabs.addTab(
+            self.lift_platform_panel,
+            tr("tab.lift_platform"),
+            category=MultiRowPanelTabs.LIBRARY_CATEGORY,
+        )
+
+        self.book_gripper_panel = BookGripperPanel()
+        self.tabs.addTab(
+            self.book_gripper_panel,
+            tr("tab.book_gripper"),
+            category=MultiRowPanelTabs.LIBRARY_CATEGORY,
+        )
+
+        self.book_debug_pose_panel = BookDebugPosePanel()
+        self.tabs.addTab(
+            self.book_debug_pose_panel,
+            tr("tab.book_debug_pose"),
+            category=MultiRowPanelTabs.LIBRARY_CATEGORY,
+        )
+
+        self.image_recognition_panel = RealSensePointPanel(workflow_mode="image_recognition")
+        self.tabs.addTab(
+            self.image_recognition_panel,
+            tr("tab.image_recognition"),
+            category=MultiRowPanelTabs.LIBRARY_CATEGORY,
+        )
+        self.image_recognition_viewer = self.image_recognition_panel.viewer_widget()
+        self.left_stack.addWidget(self.image_recognition_viewer)
 
         self.book_takeout_panel = RealSensePointPanel(workflow_mode="takeout")
         self.tabs.addTab(
@@ -282,15 +330,6 @@ class MainWindow(QMainWindow):
         )
         self.book_tail_putback_viewer = self.book_tail_putback_panel.viewer_widget()
         self.left_stack.addWidget(self.book_tail_putback_viewer)
-
-        self.image_recognition_panel = RealSensePointPanel(workflow_mode="image_recognition")
-        self.tabs.addTab(
-            self.image_recognition_panel,
-            tr("tab.image_recognition"),
-            category=MultiRowPanelTabs.LIBRARY_CATEGORY,
-        )
-        self.image_recognition_viewer = self.image_recognition_panel.viewer_widget()
-        self.left_stack.addWidget(self.image_recognition_viewer)
 
         self.teaching_panel = TeachingPanel()
         self.tabs.addTab(self.teaching_panel, tr("tab.teaching"))
@@ -340,11 +379,12 @@ class MainWindow(QMainWindow):
         self._sync_book_header_zero_duration(
             self.joint_panel.zero_duration_spin.value()
         )
-        self.toolbar.set_panel_category(self.tabs.currentCategory(), emit=False)
         self.tabs.currentChanged.connect(self._on_tab_changed)
         self.tabs.categoryChanged.connect(
             lambda category: self.toolbar.set_panel_category(category, emit=False)
         )
+        self.tabs.setCategory(MultiRowPanelTabs.LIBRARY_CATEGORY)
+        self.toolbar.set_panel_category(self.tabs.currentCategory(), emit=False)
         self._sync_left_view_for_tab(self.tabs.currentIndex())
         QTimer.singleShot(0, lambda: self._adjust_dock_sizes(self.viewer_dock, self.tabs_dock))
 
@@ -398,6 +438,14 @@ class MainWindow(QMainWindow):
         self.joint_panel.zero_duration_spin.valueChanged.connect(
             self._sync_book_header_zero_duration
         )
+        self.motor_pd_panel.joint_pd_requested.connect(
+            lambda motor_id, kp, kd: self.worker.submit_command("set_joint_pd", motor_id, kp, kd)
+        )
+        self.motor_pd_panel.all_joint_pd_requested.connect(
+            lambda values: self.worker.submit_command("set_all_joint_pd", values)
+        )
+        self.motor_pd_panel.log_message.connect(self._append_log)
+        self.motor_pd_panel.error_occurred.connect(self._on_error)
 
         tp = self.trajectory_panel
         tp.move_j_requested.connect(
@@ -456,6 +504,21 @@ class MainWindow(QMainWindow):
         self.worker.tcp_offset_updated.connect(self.book_tail_putback_panel.set_tcp_offset)
         self.worker.tcp_offset_updated.connect(self.image_recognition_panel.set_tcp_offset)
 
+        self.book_debug_pose_panel.pose_saved.connect(self._on_book_debug_pose_saved)
+        self.book_debug_pose_panel.log_message.connect(self._append_log)
+        self.book_debug_pose_panel.error_occurred.connect(self._on_error)
+        self.book_gripper_panel.settings_saved.connect(self._on_book_gripper_saved)
+        self.book_gripper_panel.gripper_test_requested.connect(
+            lambda params: self.worker.submit_command("gripper_close_monitor", **params)
+        )
+        self.book_gripper_panel.move_j_requested.connect(
+            lambda joints, duration: self.worker.submit_command("move_j", joints, duration)
+        )
+        self.worker.gripper_close_done.connect(self.book_gripper_panel.notify_gripper_test_done)
+        self.worker.move_j_done.connect(self.book_gripper_panel.notify_move_done)
+        self.book_gripper_panel.log_message.connect(self._append_log)
+        self.book_gripper_panel.error_occurred.connect(self._on_error)
+
         self._connect_point_workflow_panel(self.book_takeout_panel)
         self._connect_point_workflow_panel(self.book_putback_panel)
         self._connect_point_workflow_panel(self.book_putback2_panel)
@@ -483,6 +546,31 @@ class MainWindow(QMainWindow):
         gp.set_zero_requested.connect(
             lambda: self.worker.submit_command("set_zero_position", 7)
         )
+
+        lift = self.lift_platform_panel
+        lift.connect_requested.connect(
+            lambda port, baud, slave, speed, acc, timeout: self.lift_platform_worker.submit_command(
+                "connect", port, baud, slave, speed, acc, timeout
+            )
+        )
+        lift.disconnect_requested.connect(
+            lambda: self.lift_platform_worker.submit_command("disconnect")
+        )
+        lift.move_distance_requested.connect(
+            lambda distance, speed, acc, pulses_per_cm, up_direction: self.lift_platform_worker.submit_command(
+                "move_distance", distance, speed, acc, pulses_per_cm, up_direction
+            )
+        )
+        lift.move_pulses_requested.connect(
+            lambda pulses: self.lift_platform_worker.submit_command("move_pulses", pulses)
+        )
+        lift.stop_requested.connect(
+            lambda: self.lift_platform_worker.submit_command("stop")
+        )
+        self.lift_platform_worker.connected_changed.connect(lift.set_connected)
+        self.lift_platform_worker.error_occurred.connect(lift.set_error)
+        self.lift_platform_worker.error_occurred.connect(self._on_error)
+        self.lift_platform_worker.log_message.connect(self._append_log)
 
         rod = self.rodmotor_panel
         rod.connect_requested.connect(
@@ -586,6 +674,11 @@ class MainWindow(QMainWindow):
                 "write_angle", angle, spd, acc, torque
             )
         )
+        panel.lift_move_distance_requested.connect(
+            lambda distance, speed, acc, pulses_per_cm, up_direction: self.lift_platform_worker.submit_command(
+                "move_distance", distance, speed, acc, pulses_per_cm, up_direction
+            )
+        )
         self.worker.move_l_done.connect(panel.notify_move_l_done)
         self.worker.move_j_done.connect(panel.notify_move_j_done)
         self.worker.end_pose_done.connect(panel.notify_end_pose_done)
@@ -593,8 +686,10 @@ class MainWindow(QMainWindow):
         self.rodmotor_worker.connected_changed.connect(panel.set_rod_connected)
         self.rodmotor_worker.angle_updated.connect(panel.notify_rod_angle_updated)
         self.rodmotor_worker.write_done.connect(panel.notify_rod_write_done)
+        self.lift_platform_worker.move_done.connect(panel.notify_lift_move_done)
         self.worker.error_occurred.connect(panel.notify_flow_error)
         self.rodmotor_worker.error_occurred.connect(panel.notify_flow_error)
+        self.lift_platform_worker.error_occurred.connect(panel.notify_flow_error)
         panel.log_message.connect(self._append_log)
         panel.error_occurred.connect(self._on_error)
 
@@ -608,26 +703,36 @@ class MainWindow(QMainWindow):
         self.log_dock.setWindowTitle(tr("win.log"))
         self.statusBar().showMessage(tr("win.ready"))
 
-        self.tabs.setTabText(0, tr("tab.joint"))
-        self.tabs.setTabText(1, tr("tab.trajectory"))
-        self.tabs.setTabText(2, tr("tab.tcp"))
-        self.tabs.setTabText(3, tr("tab.book_takeout"))
-        self.tabs.setTabText(4, tr("tab.book_putback"))
-        self.tabs.setTabText(5, tr("tab.book_putback2"))
-        self.tabs.setTabText(6, tr("tab.book_tail_putback"))
-        self.tabs.setTabText(7, tr("tab.image_recognition"))
-        self.tabs.setTabText(8, tr("tab.teaching"))
-        self.tabs.setTabText(9, tr("tab.diagnostics"))
-        self.tabs.setTabText(10, tr("tab.gripper"))
-        self.tabs.setTabText(11, tr("tab.rodmotor"))
-        self.tabs.setTabText(12, tr("tab.gamepad"))
+        for panel, key in (
+            (self.joint_panel, "tab.joint"),
+            (self.motor_pd_panel, "tab.motor_pd"),
+            (self.trajectory_panel, "tab.trajectory"),
+            (self.tcp_panel, "tab.tcp"),
+            (self.lift_platform_panel, "tab.lift_platform"),
+            (self.book_gripper_panel, "tab.book_gripper"),
+            (self.book_debug_pose_panel, "tab.book_debug_pose"),
+            (self.image_recognition_panel, "tab.image_recognition"),
+            (self.book_takeout_panel, "tab.book_takeout"),
+            (self.book_putback_panel, "tab.book_putback"),
+            (self.book_putback2_panel, "tab.book_putback2"),
+            (self.book_tail_putback_panel, "tab.book_tail_putback"),
+            (self.teaching_panel, "tab.teaching"),
+            (self.diagnostics_panel, "tab.diagnostics"),
+            (self.gripper_panel, "tab.gripper"),
+            (self.rodmotor_panel, "tab.rodmotor"),
+            (self.gamepad_panel, "tab.gamepad"),
+        ):
+            self.tabs.setTabText(self.tabs.indexOf(panel), tr(key))
 
-        for panel in (self.toolbar, self.joint_panel, self.trajectory_panel,
+        for panel in (self.toolbar, self.joint_panel, self.motor_pd_panel,
+                      self.trajectory_panel,
                       self.tcp_panel, self.book_takeout_panel, self.book_putback_panel,
                       self.book_putback2_panel, self.book_tail_putback_panel,
-                      self.image_recognition_panel,
-                      self.teaching_panel, self.diagnostics_panel, self.gripper_panel,
-                      self.rodmotor_panel, self.gamepad_panel, self.viewer_3d):
+                      self.image_recognition_panel, self.book_debug_pose_panel,
+                      self.book_gripper_panel, self.teaching_panel,
+                      self.diagnostics_panel, self.gripper_panel,
+                      self.lift_platform_panel, self.rodmotor_panel,
+                      self.gamepad_panel, self.viewer_3d):
             if hasattr(panel, "retranslate_ui"):
                 panel.retranslate_ui()
         self.monitoring_window.retranslate_ui()
@@ -668,6 +773,24 @@ class MainWindow(QMainWindow):
             self.book_tail_putback_panel,
         ):
             panel.set_header_zero_duration(duration_s)
+
+    def _on_book_debug_pose_saved(self, pose_deg: list):
+        for panel in (
+            self.book_takeout_panel,
+            self.book_putback_panel,
+            self.book_putback2_panel,
+            self.book_tail_putback_panel,
+        ):
+            panel.set_book_debug_pose_deg(pose_deg)
+
+    def _on_book_gripper_saved(self, values: dict):
+        for panel in (
+            self.book_takeout_panel,
+            self.book_putback_panel,
+            self.book_putback2_panel,
+            self.book_tail_putback_panel,
+        ):
+            panel.set_book_gripper_defaults(values)
 
     def _on_tab_changed(self, index: int):
         self._sync_left_view_for_tab(index)
@@ -821,6 +944,7 @@ class MainWindow(QMainWindow):
             self.monitoring_window.close()
         self.worker.stop()
         self.rodmotor_worker.stop()
+        self.lift_platform_worker.stop()
         app = QApplication.instance()
         if app is not None:
             QTimer.singleShot(0, app.quit)

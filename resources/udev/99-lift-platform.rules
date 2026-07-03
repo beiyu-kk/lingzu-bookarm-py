@@ -1,0 +1,4 @@
+# lift platform fixed serial alias
+# Current lift platform enumerates as /dev/ttyUSB0 on this machine.
+# This CH340 adapter has no unique serial number, so the rule pins the current USB path.
+SUBSYSTEM=="tty", SUBSYSTEMS=="usb", KERNELS=="3-2.2", ATTRS{idVendor}=="1a86", ATTRS{idProduct}=="7523", SYMLINK+="lift_port", MODE="0660", GROUP="dialout"

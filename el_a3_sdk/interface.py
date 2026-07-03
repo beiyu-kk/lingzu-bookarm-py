@@ -932,6 +932,7 @@ class ELA3Interface:
         min_monitor_s: float = 0.35,
         hold_margin: float = 0.009,
         command_lead_s: float = 0.25,
+        stall_lead_threshold_min: float = 0.0,
         start_effort: Optional[float] = None,
         start_boost_s: float = 0.8,
     ) -> Dict[str, float | str | bool]:
@@ -961,8 +962,10 @@ class ELA3Interface:
         min_monitor_s = max(0.0, float(min_monitor_s))
         hold_margin = max(0.0, float(hold_margin))
         command_lead_s = max(0.0, float(command_lead_s))
+        stall_lead_threshold_min = max(0.0, float(stall_lead_threshold_min))
         start_boost_s = max(0.0, float(start_boost_s))
         stall_lead_threshold = max(
+            stall_lead_threshold_min,
             stall_tolerance * 3.0,
             hold_margin * 2.0,
             close_speed * min(max(command_lead_s, monitor_period_s), 0.25) * 0.5,

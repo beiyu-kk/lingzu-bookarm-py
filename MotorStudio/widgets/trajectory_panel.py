@@ -21,7 +21,7 @@ JOINT_NAMES_ORDERED = [
 M_TO_CM = 100.0
 CM_TO_M = 0.01
 
-MOVEL_DEBUG_JOINTS_DEG = [0.0, 35.0, -35.0, 0.0, -20.0, 0.0]
+MOVEL_DEBUG_JOINTS_DEG = [0.0, 35.0, -45.0, 0.0, 0.0, 0.0]
 MOVEL_DEBUG_POSE = [-15.0, 0.0, 25.0, 90.0, 0.0, 90.0]
 MOVEJ_DEBUG_JOINTS_DEG = [0.0, 35.0, -45.0, 0.0, 0.0, 0.0]
 
@@ -138,7 +138,7 @@ class TrajectoryPanel(QWidget):
 
         debug_layout = QHBoxLayout()
         self.movej_debug_btn = QPushButton(tr("traj.move_debug"))
-        self.movej_debug_btn.setToolTip("MoveJ to [0, 35, -35, 0, 0, 0]")
+        self.movej_debug_btn.setToolTip("MoveJ to [0, 35, -45, 0, 0, 0]")
         self.movej_debug_btn.clicked.connect(self._movej_to_debug_pose)
         debug_layout.addWidget(self.movej_debug_btn)
         debug_layout.addStretch()
@@ -283,7 +283,7 @@ class TrajectoryPanel(QWidget):
         self.movej_dur_label.setText(tr("traj.duration"))
         self.movej_exec_btn.setText(tr("traj.exec_movej"))
         self.movej_debug_btn.setText(tr("traj.move_debug"))
-        self.movej_debug_btn.setToolTip("MoveJ to [0, 35, -35, 0, 0, 0]")
+        self.movej_debug_btn.setToolTip("MoveJ to [0, 35, -45, 0, 0, 0]")
         self.movel_group.setTitle(tr("traj.cart_target"))
         self.read_pose_btn.setText(tr("traj.read_pose"))
         self.read_pose_btn.setToolTip(tr("traj.read_pose_tip"))
