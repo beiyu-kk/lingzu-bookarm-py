@@ -29,6 +29,7 @@ from MotorStudio.widgets.gamepad_panel import GamepadPanel
 from MotorStudio.widgets.realsense_point_panel import RealSensePointPanel
 from MotorStudio.widgets.viewer_3d import Viewer3DPanel
 from MotorStudio.utils.i18n import tr
+from MotorStudio.utils.lift_platform_defaults import load_lift_platform_defaults
 from MotorStudio.utils.theme_manager import ThemeManager
 
 logger = logging.getLogger("MotorStudio")
@@ -675,10 +676,9 @@ class MainWindow(QMainWindow):
             )
         )
         panel.lift_move_distance_requested.connect(
-            lambda distance, speed, acc, pulses_per_cm, up_direction: self.lift_platform_worker.submit_command(
-                "move_distance", distance, speed, acc, pulses_per_cm, up_direction
-            )
+            self._submit_workflow_lift_move_distance
         )
+        panel.workflow_stop_requested.connect(self._submit_workflow_stop)
         self.worker.move_l_done.connect(panel.notify_move_l_done)
         self.worker.move_j_done.connect(panel.notify_move_j_done)
         self.worker.end_pose_done.connect(panel.notify_end_pose_done)
@@ -692,6 +692,39 @@ class MainWindow(QMainWindow):
         self.lift_platform_worker.error_occurred.connect(panel.notify_flow_error)
         panel.log_message.connect(self._append_log)
         panel.error_occurred.connect(self._on_error)
+
+    def _submit_workflow_stop(self):
+        self.worker.submit_command("cancel_motion")
+        self.lift_platform_worker.submit_command("stop")
+
+    def _submit_workflow_lift_move_distance(
+        self,
+        distance: float,
+        speed: int,
+        acc: int,
+        pulses_per_cm: float,
+        up_direction: int,
+    ):
+        if not self.lift_platform_worker.is_connected:
+            settings = load_lift_platform_defaults()
+            self.lift_platform_worker.submit_command(
+                "connect",
+                str(settings["port"]),
+                int(settings["baudrate"]),
+                int(settings["slave_id"]),
+                int(settings["speed_rpm"]),
+                int(settings["acceleration"]),
+                float(settings["timeout"]),
+            )
+            self._append_log("升降台未连接，已按默认参数自动连接")
+        self.lift_platform_worker.submit_command(
+            "move_distance",
+            distance,
+            speed,
+            acc,
+            pulses_per_cm,
+            up_direction,
+        )
 
     # ---- retranslate ----
 

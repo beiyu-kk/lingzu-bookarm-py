@@ -1065,8 +1065,12 @@ class RealSensePointPanel(QWidget):
     DEFAULT_GRIPPER_HOLD_MARGIN_DEG = 0.5
     DEFAULT_PUTBACK_TARGET_RPY_DEG = (90.0, 0.0, 60.0)
     DEFAULT_PUTBACK_INSERT_RPY_DEG = (90.0, 0.0, 90.0)
-    DEFAULT_PUTBACK_PREPUSH_X_OFFSET_CM = 10.0
-    DEFAULT_PUTBACK_PUSH_BASE_Y_OFFSET_CM = 5.0
+    DEFAULT_PUTBACK_PREPUSH_OFFSET_CM = (10.0, 0.0, 0.0)
+    DEFAULT_PUTBACK_PREPUSH_RPY_OFFSET_DEG = (0.0, 0.0, 0.0)
+    DEFAULT_PUTBACK_PUSH_OFFSET_CM = (0.0, 0.0, 0.0)
+    DEFAULT_PUTBACK_PUSH_RPY_OFFSET_DEG = (0.0, 0.0, 0.0)
+    DEFAULT_PUTBACK_PUSH_OUT_OFFSET_CM = (0.0, 5.0, 0.0)
+    DEFAULT_PUTBACK_PUSH_OUT_RPY_OFFSET_DEG = (0.0, 0.0, 0.0)
     DEFAULT_PUTBACK_LEAVE_PUSH_Y_OFFSET_CM = 10.0
     DEFAULT_PUTBACK_INSERT_PREPOSE_X_OFFSET_CM = 10.0
     DEFAULT_PUTBACK_INSERT_PREPOSE_Y_OFFSET_CM = 1.0
@@ -1082,6 +1086,7 @@ class RealSensePointPanel(QWidget):
     DEFAULT_TAKEOUT_LIFT_POSITION = LIFT_POSITION_TAKE
     DEFAULT_TARGET_RELATIVE_OFFSET_CM = (0.0, 0.0, 0.0)
     DEFAULT_TARGET_RELATIVE_RPY_DEG = (90.0, 0.0, 90.0)
+    DEFAULT_TARGET_RELATIVE_DURATION_S = 2.0
     DEFAULT_POST_GRIPPER_MOVEJ_OFFSET_CM = (0.0, 0.0, 0.0)
     DEFAULT_POST_GRIPPER_MOVEJ_RPY_OFFSET_DEG = (0.0, 0.0, 0.0)
     DEFAULT_POST_GRIPPER_MOVEJ_DURATION_S = 2.0
@@ -1137,6 +1142,12 @@ class RealSensePointPanel(QWidget):
     DEFAULT_PUTBACK2_COMBO_FULL_OPEN_SPEED_DEG_S = 8.0
     DEFAULT_PUTBACK2_AFTER_COMBO_X_OFFSET_CM = 10.0
     DEFAULT_PUTBACK2_AFTER_COMBO_X_DURATION_S = 2.0
+    DEFAULT_TAKEOUT_SPECIFIED_POSE_CM = (0.0, 0.0, 0.0)
+    DEFAULT_TAKEOUT_SPECIFIED_POSE_RPY_DEG = (0.0, 0.0, 0.0)
+    DEFAULT_TAKEOUT_SPECIFIED_POSE_DURATION_S = 3.0
+    DEFAULT_TAKEOUT_STEP13_FINE_TUNE_OFFSET_CM = (0.0, 0.0, 0.0)
+    DEFAULT_TAKEOUT_STEP13_FINE_TUNE_RPY_OFFSET_DEG = (0.0, 0.0, 0.0)
+    DEFAULT_TAKEOUT_STEP13_FINE_TUNE_DURATION_S = 3.0
     DEFAULT_FINAL_JOINTS_DEG = (-119.64, 67.09, 67.22, 2.23, 51.75, -14.65)
     DEFAULT_TURN_DURATION_S = 6.0
     DEFAULT_DEBUG_MOVE_DURATION_S = 3.0
@@ -1154,6 +1165,7 @@ class RealSensePointPanel(QWidget):
     rod_connect_requested = pyqtSignal(str, int, float)
     rod_write_requested = pyqtSignal(float, int, int, float)
     lift_move_distance_requested = pyqtSignal(float, int, int, float, int)
+    workflow_stop_requested = pyqtSignal()
     log_message = pyqtSignal(str)
     error_occurred = pyqtSignal(str)
 
@@ -1188,6 +1200,7 @@ class RealSensePointPanel(QWidget):
         self._arm_enabled = False
         self._rod_connected = False
         self._flow_active = False
+        self._flow_auto_run = False
         self._flow_step_index = 0
         self._flow_waiting_motion = False
         self._flow_waiting_kind: Optional[str] = None
@@ -1214,6 +1227,7 @@ class RealSensePointPanel(QWidget):
         self._workflow_default_edit_snapshot: dict[str, object] = {}
         self._workflow_defaults = _load_book_workflow_defaults(self._workflow_mode)
         self._loading_workflow_defaults = False
+        self._takeout_step_buttons: list[QPushButton] = []
         self._viewer_visible = False
         self._viewer_widget = None
         self._serial = self.DEFAULT_SERIAL
@@ -1286,6 +1300,23 @@ class RealSensePointPanel(QWidget):
         self.flow_steps_btn.clicked.connect(self._show_flow_steps_dialog)
         self._compact_flow_button(self.flow_steps_btn)
         management_row.addWidget(self.flow_steps_btn)
+        self.flow_auto_run_btn = QPushButton("完整执行")
+        self.flow_auto_run_btn.setObjectName("enableBtn")
+        self.flow_auto_run_btn.clicked.connect(self._start_auto_book_grasp_flow)
+        self._compact_flow_button(
+            self.flow_auto_run_btn,
+            ["完整执行", "自动执行中"],
+        )
+        if self._workflow_mode != "takeout":
+            self.flow_auto_run_btn.hide()
+        management_row.addWidget(self.flow_auto_run_btn)
+        self.flow_emergency_stop_btn = QPushButton("急停")
+        self.flow_emergency_stop_btn.setObjectName("emergencyStop")
+        self.flow_emergency_stop_btn.clicked.connect(self._request_workflow_stop)
+        self._compact_flow_button(self.flow_emergency_stop_btn)
+        if self._workflow_mode != "takeout":
+            self.flow_emergency_stop_btn.hide()
+        management_row.addWidget(self.flow_emergency_stop_btn)
         self.flow_debug_move_btn = QPushButton("运动到图书调试位")
         self.flow_debug_move_btn.clicked.connect(self._move_to_debug_pose_from_header)
         self._compact_flow_button(self.flow_debug_move_btn)
@@ -1339,19 +1370,18 @@ class RealSensePointPanel(QWidget):
                 tr("pc.workflow_next"),
                 "开始执行",
                 "确认执行第 12 步",
+                "确认执行第 16 步",
                 "流程完成，点击重置",
             ],
         )
         btn_row.addWidget(self.flow_next_btn)
-        self.flow_back_btn = QPushButton(self._workflow_back_button_text())
+        self.flow_back_btn = QPushButton(tr("pc.workflow_back_step"))
         self.flow_back_btn.clicked.connect(self._return_to_previous_flow_step)
         self._compact_flow_button(self.flow_back_btn)
         btn_row.addWidget(self.flow_back_btn)
         self.flow_back_pose_btn = QPushButton(tr("pc.workflow_back_pose"))
         self.flow_back_pose_btn.clicked.connect(self._rollback_to_previous_flow_pose)
         self._compact_flow_button(self.flow_back_pose_btn)
-        if self._workflow_mode != "tail_putback":
-            self.flow_back_pose_btn.hide()
         btn_row.addWidget(self.flow_back_pose_btn)
         self.flow_reset_btn = QPushButton(tr("pc.workflow_reset"))
         self.flow_reset_btn.clicked.connect(self._reset_book_grasp_flow)
@@ -1586,6 +1616,7 @@ class RealSensePointPanel(QWidget):
             step1, step1_layout = self._create_step_group("步骤1：采集点云")
             layout.addWidget(step1, row, 0, 1, 5)
             step1_layout.addWidget(QLabel("点云采集由顶部流程按钮触发"), 0, 0, 1, 5)
+            self._add_takeout_step_button(step1_layout, 0, 1)
 
             row += 1
             step2, step2_layout = self._create_step_group("步骤2：识别书籍")
@@ -1604,6 +1635,7 @@ class RealSensePointPanel(QWidget):
             template_row.addWidget(self.template_combo)
             template_row.addStretch()
             step2_layout.addLayout(template_row, 0, 0, 1, 5)
+            self._add_takeout_step_button(step2_layout, 1, 1)
 
             row += 1
             step3, step3_layout = self._create_step_group("步骤3：解算目标点")
@@ -1633,6 +1665,7 @@ class RealSensePointPanel(QWidget):
             comp_row.addStretch()
             step3_layout.addLayout(comp_row, 2, 1, 1, 4)
             self._bind_workflow_target_refresh(self.target_comp_xyz_spins)
+            self._add_takeout_step_button(step3_layout, 2, 3)
 
             row += 1
             row = self._populate_takeout_controls(layout, row)
@@ -1680,10 +1713,12 @@ class RealSensePointPanel(QWidget):
         self.pregrasp_prepare_tools_check = QCheckBox("打开夹爪，并将杆电机运动到 0°")
         self.pregrasp_prepare_tools_check.setChecked(True)
         group_layout.addWidget(self.pregrasp_prepare_tools_check, 3, 0, 1, 5)
+        self._add_takeout_step_button(group_layout, 3, 4)
 
         step5, step5_layout = self._create_step_group("步骤5：到达抓取位姿")
         layout.addWidget(step5, base_row + 1, 0, 1, 5)
         step5_layout.addWidget(QLabel("执行后自动记录抓取位姿"), 0, 0, 1, 5)
+        self._add_takeout_step_button(step5_layout, 4, 1)
 
         step6, step6_layout = self._create_step_group("步骤6：杆电机到夹取位")
         layout.addWidget(step6, base_row + 2, 0, 1, 5)
@@ -1706,6 +1741,7 @@ class RealSensePointPanel(QWidget):
         self.rod_acc_spin = self._make_int_spin(1, 10000, self.DEFAULT_ROD_ACC, 10)
         step6_layout.addWidget(self.rod_acc_spin, 1, 3)
         step6_layout.setColumnStretch(4, 1)
+        self._add_takeout_step_button(step6_layout, 5, 2)
 
         step7, step7_layout = self._create_step_group("步骤7：微调抓取位姿")
         layout.addWidget(step7, base_row + 3, 0, 1, 5)
@@ -1731,10 +1767,25 @@ class RealSensePointPanel(QWidget):
             target_rpy_row.addWidget(spin)
         target_rpy_row.addStretch()
         step7_layout.addLayout(target_rpy_row, 1, 1, 1, 4)
+        self.relative_target_duration_spin = self._make_float_spin(
+            0.5,
+            30.0,
+            self.DEFAULT_TARGET_RELATIVE_DURATION_S,
+            0.5,
+            " s",
+        )
+        self._add_compact_value_row(
+            step7_layout,
+            2,
+            "MoveL时间:",
+            self.relative_target_duration_spin,
+        )
+        self._add_takeout_step_button(step7_layout, 6, 3)
 
         step8, step8_layout = self._create_step_group("步骤8：夹爪带监测持续关闭")
         layout.addWidget(step8, base_row + 4, 0, 1, 5)
         step8_layout.addWidget(QLabel("夹爪角度、速度、力矩和监测参数在夹爪管理页签中设置"), 0, 0, 1, 5)
+        self._add_takeout_step_button(step8_layout, 7, 1)
 
         if self._workflow_mode == "putback2":
             step9, step9_layout = self._create_step_group("步骤9：姿态恢复到默认RPY")
@@ -2040,6 +2091,7 @@ class RealSensePointPanel(QWidget):
             "MoveJ时间:",
             self.post_gripper_movej_duration_spin,
         )
+        self._add_takeout_step_button(step9_layout, 8, 3)
 
         step10, step10_layout = self._create_step_group("步骤10：回到图书调试位")
         layout.addWidget(step10, base_row + 6, 0, 1, 5)
@@ -2050,23 +2102,19 @@ class RealSensePointPanel(QWidget):
         self._add_indexed_joint_spins(step10_layout, 0, "目标关节:", self.debug_joint_spins)
         self.flow_debug_duration_spin = self._make_float_spin(3.0, 20.0, self.DEFAULT_DEBUG_MOVE_DURATION_S, 0.5, " s")
         self._add_compact_value_row(step10_layout, 2, "MoveJ时间:", self.flow_debug_duration_spin)
+        self._add_takeout_step_button(step10_layout, 9, 3)
 
-        step_lift, step_lift_layout = self._create_step_group("步骤11：升降台移动到还书位")
+        step_lift, step_lift_layout = self._create_step_group("步骤11：升降台从取书位移动到还书位")
         layout.addWidget(step_lift, base_row + 7, 0, 1, 5)
-        self.takeout_lift_current_combo = QComboBox()
-        self.takeout_lift_current_combo.addItem("最低位", self.LIFT_POSITION_LOWEST)
-        self.takeout_lift_current_combo.addItem("还书位", self.LIFT_POSITION_RETURN)
-        self.takeout_lift_current_combo.addItem("取书位", self.LIFT_POSITION_TAKE)
-        self._set_workflow_control_value(
-            self.takeout_lift_current_combo,
-            self._workflow_defaults.get(
-                "takeout_lift_current_position",
-                self.DEFAULT_TAKEOUT_LIFT_POSITION,
-            ),
+        step_lift_layout.addWidget(
+            QLabel("当前位置固定: 取书位"),
+            0,
+            0,
+            1,
+            2,
         )
-        step_lift_layout.addWidget(QLabel("当前默认位置:"), 0, 0)
-        step_lift_layout.addWidget(self.takeout_lift_current_combo, 0, 1)
         step_lift_layout.addWidget(QLabel("目标位置: 还书位"), 0, 2, 1, 3)
+        self._add_takeout_step_button(step_lift_layout, 10, 1)
 
         step11, step11_layout = self._create_step_group("步骤12：慢速转身到预备放书位置")
         layout.addWidget(step11, base_row + 8, 0, 1, 5)
@@ -2077,9 +2125,102 @@ class RealSensePointPanel(QWidget):
         self._add_indexed_joint_spins(step11_layout, 0, "目标关节:", self.turn_stage1_joint_spins)
         self.flow_turn_duration_spin = self._make_float_spin(3.0, 20.0, self.DEFAULT_TURN_DURATION_S, 0.5, " s")
         self._add_compact_value_row(step11_layout, 2, "转身时间:", self.flow_turn_duration_spin)
+        self._add_takeout_step_button(step11_layout, 11, 3)
 
-        step12, step12_layout = self._create_step_group("步骤13：MoveJ到最终放置构型")
-        layout.addWidget(step12, base_row + 9, 0, 1, 5)
+        step12b, step12b_layout = self._create_step_group("步骤13：IK+MoveJ到指定位姿")
+        layout.addWidget(step12b, base_row + 9, 0, 1, 5)
+        self.takeout_specified_pose_xyz_spins = []
+        for value in self.DEFAULT_TAKEOUT_SPECIFIED_POSE_CM:
+            spin = self._make_float_spin(-200.0, 200.0, value, 0.5, " cm")
+            self.takeout_specified_pose_xyz_spins.append(spin)
+        self._add_row_spins(
+            step12b_layout,
+            0,
+            "目标XYZ:",
+            self.takeout_specified_pose_xyz_spins,
+        )
+        self.takeout_specified_pose_rpy_spins = []
+        for value in self.DEFAULT_TAKEOUT_SPECIFIED_POSE_RPY_DEG:
+            spin = self._make_float_spin(-360.0, 360.0, value, 1.0, "°")
+            self.takeout_specified_pose_rpy_spins.append(spin)
+        self._add_row_spins(
+            step12b_layout,
+            1,
+            "目标Rx/Ry/Rz:",
+            self.takeout_specified_pose_rpy_spins,
+        )
+        self.takeout_specified_pose_duration_spin = self._make_float_spin(
+            0.5,
+            30.0,
+            self.DEFAULT_TAKEOUT_SPECIFIED_POSE_DURATION_S,
+            0.5,
+            " s",
+        )
+        self._add_compact_value_row(
+            step12b_layout,
+            2,
+            "MoveJ时间:",
+            self.takeout_specified_pose_duration_spin,
+        )
+        self._add_takeout_step_button(step12b_layout, 12, 3)
+
+        step13b, step13b_layout = self._create_step_group("步骤14：基于步骤13位姿微调")
+        layout.addWidget(step13b, base_row + 10, 0, 1, 5)
+        step13b_layout.addWidget(
+            QLabel("基于步骤13后的末端位姿，在机械臂基坐标系下做 MoveL 微调"),
+            0,
+            0,
+            1,
+            5,
+        )
+        self.takeout_step13_fine_tune_xyz_spins = []
+        for value in self.DEFAULT_TAKEOUT_STEP13_FINE_TUNE_OFFSET_CM:
+            spin = self._make_float_spin(-200.0, 200.0, value, 0.5, " cm")
+            self.takeout_step13_fine_tune_xyz_spins.append(spin)
+        self._add_row_spins(
+            step13b_layout,
+            1,
+            "微调XYZ:",
+            self.takeout_step13_fine_tune_xyz_spins,
+        )
+        self.takeout_step13_fine_tune_rpy_spins = []
+        for value in self.DEFAULT_TAKEOUT_STEP13_FINE_TUNE_RPY_OFFSET_DEG:
+            spin = self._make_float_spin(-180.0, 180.0, value, 1.0, "°")
+            self.takeout_step13_fine_tune_rpy_spins.append(spin)
+        self._add_row_spins(
+            step13b_layout,
+            2,
+            "微调Rx/Ry/Rz:",
+            self.takeout_step13_fine_tune_rpy_spins,
+        )
+        self.takeout_step13_fine_tune_duration_spin = self._make_float_spin(
+            0.5,
+            30.0,
+            self.DEFAULT_TAKEOUT_STEP13_FINE_TUNE_DURATION_S,
+            0.5,
+            " s",
+        )
+        self._add_compact_value_row(
+            step13b_layout,
+            3,
+            "MoveL时间:",
+            self.takeout_step13_fine_tune_duration_spin,
+        )
+        self._add_takeout_step_button(step13b_layout, 13, 4)
+
+        step14b, step14b_layout = self._create_step_group("步骤15：夹爪打开")
+        layout.addWidget(step14b, base_row + 11, 0, 1, 5)
+        step14b_layout.addWidget(
+            QLabel("打开参数使用夹爪管理页签，机械臂保持当前位姿"),
+            0,
+            0,
+            1,
+            5,
+        )
+        self._add_takeout_step_button(step14b_layout, 14, 1)
+
+        step12, step12_layout = self._create_step_group("步骤16：MoveJ到最终放置构型")
+        layout.addWidget(step12, base_row + 12, 0, 1, 5)
         self.final_joint_spins = []
         for value in self.DEFAULT_FINAL_JOINTS_DEG:
             spin = self._make_float_spin(-360.0, 360.0, value, 1.0, "°")
@@ -2093,8 +2234,9 @@ class RealSensePointPanel(QWidget):
             " s",
         )
         self._add_compact_value_row(step12_layout, 2, "MoveJ时间:", self.flow_final_duration_spin)
+        self._add_takeout_step_button(step12_layout, 15, 3)
 
-        return base_row + 10
+        return base_row + 13
 
     def _populate_putback_controls(self, layout: QGridLayout, row: int) -> int:
         base_row = row
@@ -2688,18 +2830,25 @@ class RealSensePointPanel(QWidget):
         if self._workflow_mode == "tail_putback":
             step4.setTitle("步骤5：到达预备推书点")
         layout.addWidget(step4, base_row + 3 + motion_row_offset, 0, 1, 5)
-        self.putback_prepush_x_spin = self._make_float_spin(
-            -50.0,
-            50.0,
-            self.DEFAULT_PUTBACK_PREPUSH_X_OFFSET_CM,
-            1.0,
-            " cm",
-        )
-        self._add_left_value_row(
+        self.putback_prepush_xyz_spins = []
+        for value in self.DEFAULT_PUTBACK_PREPUSH_OFFSET_CM:
+            spin = self._make_float_spin(-50.0, 50.0, value, 0.5, " cm")
+            self.putback_prepush_xyz_spins.append(spin)
+        self._add_left_spins_row(
             step4_layout,
             0,
-            "预备偏移X:",
-            self.putback_prepush_x_spin,
+            "预备偏移XYZ:",
+            self.putback_prepush_xyz_spins,
+        )
+        self.putback_prepush_rpy_offset_spins = []
+        for value in self.DEFAULT_PUTBACK_PREPUSH_RPY_OFFSET_DEG:
+            spin = self._make_float_spin(-180.0, 180.0, value, 1.0, "°")
+            self.putback_prepush_rpy_offset_spins.append(spin)
+        self._add_left_spins_row(
+            step4_layout,
+            1,
+            "姿态偏移Rx/Ry/Rz:",
+            self.putback_prepush_rpy_offset_spins,
         )
         self.flow_ik_duration_spin = self._make_float_spin(
             0.5,
@@ -2710,7 +2859,7 @@ class RealSensePointPanel(QWidget):
         )
         self._add_left_value_row(
             step4_layout,
-            1,
+            2,
             "IK+MoveJ时间:",
             self.flow_ik_duration_spin,
         )
@@ -2719,6 +2868,26 @@ class RealSensePointPanel(QWidget):
         if self._workflow_mode == "tail_putback":
             step5.setTitle("步骤6：MoveL到推书点")
         layout.addWidget(step5, base_row + 4 + motion_row_offset, 0, 1, 5)
+        self.putback_push_xyz_spins = []
+        for value in self.DEFAULT_PUTBACK_PUSH_OFFSET_CM:
+            spin = self._make_float_spin(-50.0, 50.0, value, 0.5, " cm")
+            self.putback_push_xyz_spins.append(spin)
+        self._add_left_spins_row(
+            step5_layout,
+            0,
+            "推书偏移XYZ:",
+            self.putback_push_xyz_spins,
+        )
+        self.putback_push_rpy_offset_spins = []
+        for value in self.DEFAULT_PUTBACK_PUSH_RPY_OFFSET_DEG:
+            spin = self._make_float_spin(-180.0, 180.0, value, 1.0, "°")
+            self.putback_push_rpy_offset_spins.append(spin)
+        self._add_left_spins_row(
+            step5_layout,
+            1,
+            "姿态偏移Rx/Ry/Rz:",
+            self.putback_push_rpy_offset_spins,
+        )
         self.flow_movel_duration_spin = self._make_float_spin(
             0.5,
             30.0,
@@ -2728,7 +2897,7 @@ class RealSensePointPanel(QWidget):
         )
         self._add_left_value_row(
             step5_layout,
-            0,
+            2,
             "MoveL时间:",
             self.flow_movel_duration_spin,
         )
@@ -2737,18 +2906,25 @@ class RealSensePointPanel(QWidget):
         if self._workflow_mode == "tail_putback":
             step6.setTitle("步骤7：推开书本")
         layout.addWidget(step6, base_row + 5 + motion_row_offset, 0, 1, 5)
-        self.putback_push_base_y_spin = self._make_float_spin(
-            -50.0,
-            50.0,
-            self.DEFAULT_PUTBACK_PUSH_BASE_Y_OFFSET_CM,
-            0.5,
-            " cm",
-        )
-        self._add_left_value_row(
+        self.putback_push_out_xyz_spins = []
+        for value in self.DEFAULT_PUTBACK_PUSH_OUT_OFFSET_CM:
+            spin = self._make_float_spin(-50.0, 50.0, value, 0.5, " cm")
+            self.putback_push_out_xyz_spins.append(spin)
+        self._add_left_spins_row(
             step6_layout,
             0,
-            "基坐标Y+距离:",
-            self.putback_push_base_y_spin,
+            "推开偏移XYZ:",
+            self.putback_push_out_xyz_spins,
+        )
+        self.putback_push_out_rpy_offset_spins = []
+        for value in self.DEFAULT_PUTBACK_PUSH_OUT_RPY_OFFSET_DEG:
+            spin = self._make_float_spin(-180.0, 180.0, value, 1.0, "°")
+            self.putback_push_out_rpy_offset_spins.append(spin)
+        self._add_left_spins_row(
+            step6_layout,
+            1,
+            "姿态偏移Rx/Ry/Rz:",
+            self.putback_push_out_rpy_offset_spins,
         )
         self.putback_push_movel_duration_spin = self._make_float_spin(
             0.5,
@@ -2759,7 +2935,7 @@ class RealSensePointPanel(QWidget):
         )
         self._add_left_value_row(
             step6_layout,
-            1,
+            2,
             "MoveL时间:",
             self.putback_push_movel_duration_spin,
         )
@@ -3187,6 +3363,18 @@ class RealSensePointPanel(QWidget):
         layout.setVerticalSpacing(4)
         return group, layout
 
+    def _add_takeout_step_button(self, layout: QGridLayout, step_index: int, row: int):
+        if self._workflow_mode != "takeout":
+            return
+        button = QPushButton("执行本步")
+        button.setObjectName("enableBtn")
+        button.clicked.connect(
+            lambda _checked=False, idx=step_index: self._execute_single_takeout_step(idx)
+        )
+        self._compact_flow_button(button, width_texts=("执行本步",))
+        self._takeout_step_buttons.append(button)
+        layout.addWidget(button, row, 4)
+
     @staticmethod
     def _button_text_width(widget: QWidget, texts: Sequence[str], extra: int = 28) -> int:
         fm = widget.fontMetrics()
@@ -3465,6 +3653,7 @@ class RealSensePointPanel(QWidget):
             add("rod_acc", getattr(self, "rod_acc_spin", None))
             add_many("relative_target_xyz", getattr(self, "relative_target_xyz_spins", []))
             add_many("relative_target_rpy", getattr(self, "relative_target_rpy_spins", []))
+            add("relative_target_duration", getattr(self, "relative_target_duration_spin", None))
             add("gripper_open", getattr(self, "gripper_open_spin", None))
             add("gripper_close", getattr(self, "gripper_close_spin", None))
             add("gripper_effort", getattr(self, "gripper_effort_spin", None))
@@ -3589,12 +3778,32 @@ class RealSensePointPanel(QWidget):
                 )
                 add_many("debug_joint", getattr(self, "debug_joint_spins", []))
                 add("flow_debug_duration", getattr(self, "flow_debug_duration_spin", None))
-                add(
-                    "takeout_lift_current_position",
-                    getattr(self, "takeout_lift_current_combo", None),
-                )
                 add_many("turn_stage1_joint", getattr(self, "turn_stage1_joint_spins", []))
                 add("flow_turn_duration", getattr(self, "flow_turn_duration_spin", None))
+                add_many(
+                    "takeout_specified_pose_xyz",
+                    getattr(self, "takeout_specified_pose_xyz_spins", []),
+                )
+                add_many(
+                    "takeout_specified_pose_rpy",
+                    getattr(self, "takeout_specified_pose_rpy_spins", []),
+                )
+                add(
+                    "takeout_specified_pose_duration",
+                    getattr(self, "takeout_specified_pose_duration_spin", None),
+                )
+                add_many(
+                    "takeout_step13_fine_tune_xyz",
+                    getattr(self, "takeout_step13_fine_tune_xyz_spins", []),
+                )
+                add_many(
+                    "takeout_step13_fine_tune_rpy",
+                    getattr(self, "takeout_step13_fine_tune_rpy_spins", []),
+                )
+                add(
+                    "takeout_step13_fine_tune_duration",
+                    getattr(self, "takeout_step13_fine_tune_duration_spin", None),
+                )
                 add_many("final_joint", getattr(self, "final_joint_spins", []))
                 add("flow_final_duration", getattr(self, "flow_final_duration_spin", None))
         else:
@@ -3729,8 +3938,24 @@ class RealSensePointPanel(QWidget):
             )
             add_many("putback_target_rpy", getattr(self, "putback_target_rpy_spins", []))
             add_many("putback_target_comp_xyz", getattr(self, "putback_target_comp_xyz_spins", []))
-            add("putback_prepush_x", getattr(self, "putback_prepush_x_spin", None))
-            add("putback_push_base_y", getattr(self, "putback_push_base_y_spin", None))
+            add_many("putback_prepush_xyz", getattr(self, "putback_prepush_xyz_spins", []))
+            add_many(
+                "putback_prepush_rpy_offset",
+                getattr(self, "putback_prepush_rpy_offset_spins", []),
+            )
+            add_many("putback_push_xyz", getattr(self, "putback_push_xyz_spins", []))
+            add_many(
+                "putback_push_rpy_offset",
+                getattr(self, "putback_push_rpy_offset_spins", []),
+            )
+            add_many(
+                "putback_push_out_xyz",
+                getattr(self, "putback_push_out_xyz_spins", []),
+            )
+            add_many(
+                "putback_push_out_rpy_offset",
+                getattr(self, "putback_push_out_rpy_offset_spins", []),
+            )
             add("putback_push_movel_duration", getattr(self, "putback_push_movel_duration_spin", None))
             add("putback_leave_push_y", getattr(self, "putback_leave_push_y_spin", None))
             add_many("putback_insert_rpy", getattr(self, "putback_insert_rpy_spins", []))
@@ -3814,6 +4039,16 @@ class RealSensePointPanel(QWidget):
         ):
             defaults = dict(defaults)
             defaults["putback_push_base_y"] = defaults["putback_push_right"]
+        if "putback_push_out_xyz_2" not in defaults and "putback_push_base_y" in defaults:
+            defaults = dict(defaults)
+            defaults.setdefault("putback_push_out_xyz_1", 0.0)
+            defaults["putback_push_out_xyz_2"] = defaults["putback_push_base_y"]
+            defaults.setdefault("putback_push_out_xyz_3", 0.0)
+        if "putback_prepush_xyz_1" not in defaults and "putback_prepush_x" in defaults:
+            defaults = dict(defaults)
+            defaults["putback_prepush_xyz_1"] = defaults["putback_prepush_x"]
+            defaults.setdefault("putback_prepush_xyz_2", 0.0)
+            defaults.setdefault("putback_prepush_xyz_3", 0.0)
         if (
             self._workflow_mode == "putback2"
             and "putback2_gripper_full_open" not in defaults
@@ -5087,9 +5322,6 @@ class RealSensePointPanel(QWidget):
             return tr("pc.book_putback2_group")
         return tr("pc.book_takeout_group")
 
-    def _workflow_back_button_text(self) -> str:
-        return tr("pc.workflow_back")
-
     def _current_workflow_target_rpy_deg(self) -> list[float]:
         if self._is_putback_workflow() and hasattr(self, "putback_target_rpy_spins"):
             return self._spin_values(self.putback_target_rpy_spins)
@@ -5201,8 +5433,11 @@ class RealSensePointPanel(QWidget):
             "夹爪带监测持续关闭",
             "当前位姿偏移 IK + MoveJ",
             "机械臂 MoveJ 回到图书调试位置",
-            "升降台移动到还书位",
+            "升降台从取书位移动到还书位",
             "机械臂慢速转身到预备放书位置",
+            "IK + MoveJ 到指定位姿",
+            "基于步骤13位姿 MoveL 微调",
+            "夹爪打开",
             "机械臂 MoveJ 到最终放置构型",
         ]
 
@@ -5220,6 +5455,7 @@ class RealSensePointPanel(QWidget):
 
     def _reset_book_grasp_flow(self):
         self._flow_active = False
+        self._flow_auto_run = False
         self._flow_step_index = 0
         self._flow_waiting_motion = False
         self._flow_waiting_kind = None
@@ -5238,6 +5474,43 @@ class RealSensePointPanel(QWidget):
         if hasattr(self, "flow_target_label"):
             self.flow_target_label.setText(tr("pc.workflow_target"))
         self._update_flow_button_state()
+
+    def _start_auto_book_grasp_flow(self):
+        if self._workflow_mode != "takeout" or self._flow_waiting_motion:
+            return
+        steps = self._book_grasp_steps()
+        if self._flow_active and self._flow_step_index >= len(steps):
+            self._reset_book_grasp_flow()
+        self._flow_auto_run = True
+        if not self._flow_active:
+            self._flow_step_index = 0
+        self._execute_next_book_grasp_step()
+
+    def _schedule_auto_book_grasp_step(self):
+        if (
+            self._workflow_mode != "takeout"
+            or not self._flow_auto_run
+            or self._flow_waiting_motion
+            or not self._flow_active
+            or self._flow_step_index >= len(self._book_grasp_steps())
+        ):
+            return
+        QTimer.singleShot(0, self._execute_next_book_grasp_step)
+
+    def _request_workflow_stop(self):
+        self._flow_auto_run = False
+        self._flow_waiting_motion = False
+        self._flow_waiting_kind = None
+        self._flow_rollback_waiting = False
+        self._flow_rollback_entry = None
+        self._flow_pending_pose = None
+        self._rod_target_angle_deg = None
+        self._clear_gripper_close_monitor()
+        self._clear_manual_gripper_open()
+        self.flow_status_label.setText("流程急停已触发，已停止继续发送运动命令")
+        self.log_message.emit(f"{self._flow_log_prefix()}流程急停：停止继续发送运动命令")
+        self._update_flow_button_state()
+        self.workflow_stop_requested.emit()
 
     def _execute_next_book_grasp_step(self):
         if self._flow_waiting_motion:
@@ -5295,8 +5568,29 @@ class RealSensePointPanel(QWidget):
             self._execute_putback_motion_step(putback_step)
         else:
             self._execute_takeout_motion_step(step)
+        if (
+            self._flow_auto_run
+            and not self._flow_waiting_motion
+            and self._flow_step_index == step
+        ):
+            self._flow_auto_run = False
+            self._update_flow_button_state()
+
+    def _execute_single_takeout_step(self, step_index: int):
+        if self._workflow_mode != "takeout" or self._flow_waiting_motion:
+            return
+        self._flow_auto_run = False
+        steps = self._book_grasp_steps()
+        if step_index < 0 or step_index >= len(steps):
+            return
+        self._flow_active = True
+        self._flow_step_index = int(step_index)
+        self._execute_next_book_grasp_step()
 
     def _execute_takeout_motion_step(self, step: int):
+        if self._workflow_mode == "putback2":
+            self._execute_putback2_motion_step(step)
+            return
         if step == 3:
             self._execute_pregrasp_step()
         elif step == 4:
@@ -5308,68 +5602,118 @@ class RealSensePointPanel(QWidget):
         elif step == 7:
             self._start_monitored_gripper_close()
         elif step == 8:
-            if self._workflow_mode == "putback2":
-                self._execute_putback2_reset_rpy_step()
-            else:
-                self._execute_post_gripper_movej_offset_step()
+            self._execute_post_gripper_movej_offset_step()
         elif step == 9:
-            if self._workflow_mode == "putback2":
-                self._execute_putback2_x_offset_step()
-            else:
-                self._execute_return_debug_step()
+            self._execute_return_debug_step()
         elif step == 10:
-            if self._workflow_mode == "putback2":
-                self._start_putback2_gripper_open(partial=True)
-            else:
-                self._execute_lift_to_return_step()
+            self._execute_lift_to_return_step()
         elif step == 11:
-            if self._workflow_mode == "putback2":
-                self._write_rod_and_wait(self.putback2_rod_release_spin.value())
-            else:
-                self._execute_turn_stage1_step()
+            self._execute_turn_stage1_step()
         elif step == 12:
-            if self._workflow_mode != "putback2":
-                self._execute_final_joint_step()
-            else:
-                self._execute_putback2_z_offset_step()
-        elif step == 13 and self._workflow_mode == "putback2":
+            self._execute_takeout_specified_pose_step()
+        elif step == 13:
+            self._execute_takeout_step13_fine_tune_step()
+        elif step == 14:
+            self._execute_takeout_gripper_open_step()
+        elif step == 15:
+            self._execute_final_joint_step()
+
+    def _execute_putback2_motion_step(self, step: int):
+        if step == 3:
+            self._execute_pregrasp_step()
+        elif step == 4:
+            self._execute_approach_step()
+        elif step == 5:
+            self._write_rod_and_wait(self.rod_grasp_spin.value())
+        elif step == 6:
+            self._execute_relative_target_step()
+        elif step == 7:
+            self._start_monitored_gripper_close()
+        elif step == 8:
+            self._execute_putback2_reset_rpy_step()
+        elif step == 9:
+            self._execute_putback2_x_offset_step()
+        elif step == 10:
+            self._start_putback2_gripper_open(partial=True)
+        elif step == 11:
+            self._write_rod_and_wait(self.putback2_rod_release_spin.value())
+        elif step == 12:
+            self._execute_putback2_z_offset_step()
+        elif step == 13:
             self._start_putback2_gripper_open(partial=False)
-        elif step == 14 and self._workflow_mode == "putback2":
+        elif step == 14:
             self._execute_putback2_after_open_x1_step()
-        elif step == 15 and self._workflow_mode == "putback2":
+        elif step == 15:
             self._start_putback2_combo_step()
-        elif step == 16 and self._workflow_mode == "putback2":
+        elif step == 16:
             self._execute_putback2_after_combo_x_step()
 
     def _execute_putback_motion_step(self, step: int):
         if step == 3:
+            xyz_offset = self._spin_values(getattr(self, "putback_prepush_xyz_spins", []))
+            if len(xyz_offset) < 3:
+                xyz_offset = list(self.DEFAULT_PUTBACK_PREPUSH_OFFSET_CM)
+            rpy_offset = self._spin_values(
+                getattr(self, "putback_prepush_rpy_offset_spins", [])
+            )
+            if len(rpy_offset) < 3:
+                rpy_offset = list(self.DEFAULT_PUTBACK_PREPUSH_RPY_OFFSET_DEG)
+            target_rpy = self._spin_values(self.putback_target_rpy_spins)
             pose = self._make_putback_target_pose(
-                x_offset_cm=self.putback_prepush_x_spin.value(),
-                y_offset_cm=0.0,
-                z_offset_cm=0.0,
-                rpy_deg=self._spin_values(self.putback_target_rpy_spins),
+                x_offset_cm=xyz_offset[0],
+                y_offset_cm=xyz_offset[1],
+                z_offset_cm=xyz_offset[2],
+                rpy_deg=[
+                    float(target_rpy[0]) + float(rpy_offset[0]),
+                    float(target_rpy[1]) + float(rpy_offset[1]),
+                    float(target_rpy[2]) + float(rpy_offset[2]),
+                ],
             )
             self._send_blocking_end_pose(pose, "等待机械臂 IK + MoveJ 到预备推书点")
         elif step == 4:
+            xyz_offset = self._spin_values(getattr(self, "putback_push_xyz_spins", []))
+            if len(xyz_offset) < 3:
+                xyz_offset = list(self.DEFAULT_PUTBACK_PUSH_OFFSET_CM)
+            rpy_offset = self._spin_values(
+                getattr(self, "putback_push_rpy_offset_spins", [])
+            )
+            if len(rpy_offset) < 3:
+                rpy_offset = list(self.DEFAULT_PUTBACK_PUSH_RPY_OFFSET_DEG)
+            target_rpy = self._spin_values(self.putback_target_rpy_spins)
             pose = self._make_putback_target_pose(
-                x_offset_cm=0.0,
-                y_offset_cm=0.0,
-                z_offset_cm=0.0,
-                rpy_deg=self._spin_values(self.putback_target_rpy_spins),
+                x_offset_cm=xyz_offset[0],
+                y_offset_cm=xyz_offset[1],
+                z_offset_cm=xyz_offset[2],
+                rpy_deg=[
+                    float(target_rpy[0]) + float(rpy_offset[0]),
+                    float(target_rpy[1]) + float(rpy_offset[1]),
+                    float(target_rpy[2]) + float(rpy_offset[2]),
+                ],
             )
             self._send_blocking_movel(pose, "等待机械臂 MoveL 到推书点")
         elif step == 5:
+            xyz_offset = self._spin_values(getattr(self, "putback_push_out_xyz_spins", []))
+            if len(xyz_offset) < 3:
+                xyz_offset = list(self.DEFAULT_PUTBACK_PUSH_OUT_OFFSET_CM)
+            rpy_offset = self._spin_values(
+                getattr(self, "putback_push_out_rpy_offset_spins", [])
+            )
+            if len(rpy_offset) < 3:
+                rpy_offset = list(self.DEFAULT_PUTBACK_PUSH_OUT_RPY_OFFSET_DEG)
             pose = self._make_pose_from_current_end_pose(
-                y_offset_cm=self.putback_push_base_y_spin.value(),
+                x_offset_cm=xyz_offset[0],
+                y_offset_cm=xyz_offset[1],
+                z_offset_cm=xyz_offset[2],
+                rpy_offset_deg=rpy_offset,
                 local_axes=False,
                 prefer_last_flow_pose=True,
             )
             if pose is None:
-                self._set_error("暂无末端位姿，无法沿基坐标系 Y+ 推书")
+                self._set_error("暂无末端位姿，无法基于当前位姿推开书本")
                 return
             self._send_blocking_movel(
                 pose,
-                "等待机械臂沿基坐标系 Y+ MoveL 推开书本",
+                "等待机械臂基于当前位姿 MoveL 推开书本",
                 duration=float(self.putback_push_movel_duration_spin.value()),
             )
         elif step == 6:
@@ -5862,7 +6206,16 @@ class RealSensePointPanel(QWidget):
             z_offset_cm=xyz_offset[2],
             rpy_deg=rpy_deg,
         )
-        self._send_blocking_movel(pose, "等待机械臂微调到抓取位姿")
+        duration = (
+            float(self.relative_target_duration_spin.value())
+            if hasattr(self, "relative_target_duration_spin")
+            else float(self.DEFAULT_TARGET_RELATIVE_DURATION_S)
+        )
+        self._send_blocking_movel(
+            pose,
+            "等待机械臂微调到抓取位姿",
+            duration=duration,
+        )
 
     def _execute_post_gripper_movej_offset_step(self):
         xyz_offset = self._spin_values(self.post_gripper_movej_xyz_spins)
@@ -6163,6 +6516,73 @@ class RealSensePointPanel(QWidget):
             f"等待机械臂慢速转身到预备放书位置 {self._format_joint_spins_deg(self.turn_stage1_joint_spins)}",
         )
 
+    def _execute_takeout_specified_pose_step(self):
+        xyz_cm = self._spin_values(self.takeout_specified_pose_xyz_spins)
+        rpy_deg = self._spin_values(self.takeout_specified_pose_rpy_spins)
+        pose = [
+            float(xyz_cm[0]) / M_TO_CM,
+            float(xyz_cm[1]) / M_TO_CM,
+            float(xyz_cm[2]) / M_TO_CM,
+            math.radians(float(rpy_deg[0])),
+            math.radians(float(rpy_deg[1])),
+            math.radians(float(rpy_deg[2])),
+        ]
+        self._send_blocking_end_pose(
+            pose,
+            (
+                "等待机械臂 IK + MoveJ 到指定位姿 "
+                f"XYZ=[{xyz_cm[0]:.2f}, {xyz_cm[1]:.2f}, {xyz_cm[2]:.2f}]cm "
+                f"RPY=[{rpy_deg[0]:.2f}, {rpy_deg[1]:.2f}, {rpy_deg[2]:.2f}]°"
+            ),
+            duration=float(self.takeout_specified_pose_duration_spin.value()),
+        )
+
+    def _execute_takeout_step13_fine_tune_step(self):
+        xyz_offset = self._spin_values(
+            getattr(self, "takeout_step13_fine_tune_xyz_spins", [])
+        )
+        if len(xyz_offset) < 3:
+            xyz_offset = list(self.DEFAULT_TAKEOUT_STEP13_FINE_TUNE_OFFSET_CM)
+        rpy_offset = self._spin_values(
+            getattr(self, "takeout_step13_fine_tune_rpy_spins", [])
+        )
+        if len(rpy_offset) < 3:
+            rpy_offset = list(self.DEFAULT_TAKEOUT_STEP13_FINE_TUNE_RPY_OFFSET_DEG)
+        pose = self._make_pose_from_current_end_pose(
+            x_offset_cm=xyz_offset[0],
+            y_offset_cm=xyz_offset[1],
+            z_offset_cm=xyz_offset[2],
+            rpy_offset_deg=rpy_offset,
+            local_axes=False,
+            prefer_last_flow_pose=True,
+        )
+        if pose is None:
+            self._set_error("暂无步骤13后的末端位姿反馈，无法执行步骤14微调")
+            return
+        duration = (
+            float(self.takeout_step13_fine_tune_duration_spin.value())
+            if hasattr(self, "takeout_step13_fine_tune_duration_spin")
+            else float(self.DEFAULT_TAKEOUT_STEP13_FINE_TUNE_DURATION_S)
+        )
+        self._send_blocking_movel(
+            pose,
+            (
+                "等待机械臂基于步骤13位姿 MoveL 微调 "
+                f"XYZ=[{xyz_offset[0]:.2f}, {xyz_offset[1]:.2f}, {xyz_offset[2]:.2f}]cm "
+                f"RPY=[{rpy_offset[0]:.2f}, {rpy_offset[1]:.2f}, {rpy_offset[2]:.2f}]°"
+            ),
+            duration=duration,
+        )
+
+    def _execute_takeout_gripper_open_step(self):
+        self._start_shared_gripper_open(
+            waiting_kind="manual_gripper_open",
+            waiting_text=(
+                "等待步骤15夹爪缓慢打开到 "
+                f"{float(self.gripper_open_spin.value()):.1f}°"
+            ),
+        )
+
     def _execute_final_joint_step(self):
         self._send_joint_movej(
             self.final_joint_spins,
@@ -6194,7 +6614,7 @@ class RealSensePointPanel(QWidget):
 
     def _execute_lift_to_return_step(self):
         settings = load_lift_platform_defaults()
-        current_position = self._current_takeout_lift_position()
+        current_position = self.LIFT_POSITION_TAKE
         target_position = self.LIFT_POSITION_RETURN
         delta_cm = (
             self._lift_position_height_cm(target_position, settings)
@@ -6207,7 +6627,7 @@ class RealSensePointPanel(QWidget):
         self._flow_waiting_kind = "lift"
         self._flow_pending_pose = None
         self._update_flow_button_state()
-        self.flow_status_label.setText(f"等待升降台移动到还书位 ({delta_cm:.3f} cm)")
+        self.flow_status_label.setText(f"等待升降台从取书位移动到还书位 ({delta_cm:.3f} cm)")
         self.lift_move_distance_requested.emit(
             delta_cm,
             int(settings.get("speed_rpm", DEFAULT_LIFT_SPEED_RPM)),
@@ -6345,6 +6765,7 @@ class RealSensePointPanel(QWidget):
     def _rollback_to_previous_flow_pose(self):
         if self._flow_waiting_motion:
             return
+        self._flow_auto_run = False
         if not self._flow_pose_history:
             self.flow_status_label.setText("没有可回退的位置")
             return
@@ -6367,11 +6788,9 @@ class RealSensePointPanel(QWidget):
         )
 
     def _return_to_previous_flow_step(self):
-        self._rollback_to_previous_flow_pose()
-
-    def _return_to_previous_tail_putback_step(self):
         if self._flow_waiting_motion:
             return
+        self._flow_auto_run = False
         if not self._flow_active or self._flow_step_index <= 0:
             self.flow_status_label.setText("没有可返回的上一步")
             return
@@ -6854,6 +7273,7 @@ class RealSensePointPanel(QWidget):
         self._flow_waiting_kind = None
         self._flow_step_index += 1
         if self._flow_step_index >= len(self._book_grasp_steps()):
+            self._flow_auto_run = False
             self.flow_status_label.setText(f"流程完成：{message}")
             self.log_message.emit(f"{self._flow_log_prefix()}完成")
         else:
@@ -6862,6 +7282,7 @@ class RealSensePointPanel(QWidget):
                 f"{message}。请确认后执行 [{self._flow_step_index + 1}/{len(self._book_grasp_steps())}] {next_step}"
             )
         self._update_flow_button_state()
+        self._schedule_auto_book_grasp_step()
 
     def _begin_flow_wait(self, kind: str):
         self._flow_waiting_motion = True
@@ -6956,11 +7377,6 @@ class RealSensePointPanel(QWidget):
     def notify_lift_move_done(self):
         if self._flow_waiting_kind != "lift":
             return
-        if hasattr(self, "takeout_lift_current_combo"):
-            self._set_workflow_control_value(
-                self.takeout_lift_current_combo,
-                self.LIFT_POSITION_RETURN,
-            )
         if self._flow_active and self._flow_waiting_motion:
             self._advance_book_grasp_flow("升降台已移动到还书位")
 
@@ -6989,6 +7405,7 @@ class RealSensePointPanel(QWidget):
             )
 
     def notify_flow_error(self, message: str):
+        self._flow_auto_run = False
         rollback_failed = self._flow_rollback_waiting
         rollback_entry = self._flow_rollback_entry
         if self._flow_waiting_kind in {
@@ -7071,21 +7488,38 @@ class RealSensePointPanel(QWidget):
             self.flow_gripper_open_btn.setEnabled(
                 self._arm_enabled and not self._flow_waiting_motion
             )
-        self.flow_next_btn.setEnabled(can_step)
+        if hasattr(self, "flow_auto_run_btn"):
+            auto_visible = self._workflow_mode == "takeout"
+            self.flow_auto_run_btn.setVisible(auto_visible)
+            self.flow_auto_run_btn.setEnabled(
+                auto_visible and can_step and not completed and not self._flow_auto_run
+            )
+            self.flow_auto_run_btn.setText(
+                "自动执行中" if self._flow_auto_run else "完整执行"
+            )
+        if hasattr(self, "flow_emergency_stop_btn"):
+            estop_visible = self._workflow_mode == "takeout"
+            self.flow_emergency_stop_btn.setVisible(estop_visible)
+            self.flow_emergency_stop_btn.setEnabled(estop_visible)
+        self.flow_next_btn.setEnabled(can_step and not self._flow_auto_run)
         if hasattr(self, "flow_back_btn"):
             can_back = (
-                self._arm_enabled
-                and not self._flow_waiting_motion
-                and bool(self._flow_pose_history)
+                not self._flow_waiting_motion
+                and self._flow_active
+                and self._flow_step_index > 0
+                and not completed
+                and not self._flow_auto_run
             )
             self.flow_back_btn.setEnabled(can_back)
         if hasattr(self, "flow_back_pose_btn"):
-            self.flow_back_pose_btn.setVisible(self._workflow_mode == "tail_putback")
             self.flow_back_pose_btn.setEnabled(
                 self._arm_enabled
                 and not self._flow_waiting_motion
                 and bool(self._flow_pose_history)
+                and not self._flow_auto_run
             )
+        for button in getattr(self, "_takeout_step_buttons", []):
+            button.setEnabled(can_step and not completed and not self._flow_auto_run)
         if completed:
             self.flow_next_btn.setText("流程完成，点击重置")
         elif not self._flow_active:
@@ -7123,6 +7557,7 @@ class RealSensePointPanel(QWidget):
         self._update_flow_button_state()
 
     def _set_error(self, message: str):
+        self._flow_auto_run = False
         self.status_label.setText(message)
         self.error_occurred.emit(message)
 
@@ -7165,6 +7600,12 @@ class RealSensePointPanel(QWidget):
             self.flow_detect_btn.setText(tr("pc.workflow_detect"))
         if hasattr(self, "flow_steps_btn"):
             self.flow_steps_btn.setText(tr("pc.workflow_steps"))
+        if hasattr(self, "flow_auto_run_btn"):
+            self.flow_auto_run_btn.setText(
+                "自动执行中" if self._flow_auto_run else "完整执行"
+            )
+        if hasattr(self, "flow_emergency_stop_btn"):
+            self.flow_emergency_stop_btn.setText("急停")
         if hasattr(self, "flow_debug_move_btn"):
             self.flow_debug_move_btn.setText("运动到图书调试位")
         if hasattr(self, "flow_zero_move_btn"):
@@ -7176,14 +7617,15 @@ class RealSensePointPanel(QWidget):
         if hasattr(self, "flow_reset_btn"):
             self.flow_reset_btn.setText(tr("pc.workflow_reset"))
         if hasattr(self, "flow_back_btn"):
-            self.flow_back_btn.setText(self._workflow_back_button_text())
+            self.flow_back_btn.setText(tr("pc.workflow_back_step"))
         if hasattr(self, "flow_back_pose_btn"):
             self.flow_back_pose_btn.setText(tr("pc.workflow_back_pose"))
-            self.flow_back_pose_btn.setVisible(self._workflow_mode == "tail_putback")
         if hasattr(self, "flow_defaults_btn"):
             self._update_workflow_default_edit_buttons()
         if hasattr(self, "flow_next_btn"):
             self._update_flow_button_state()
+        for button in getattr(self, "_takeout_step_buttons", []):
+            button.setText("执行本步")
         if hasattr(self, "flow_status_label") and not self._flow_active:
             self.flow_status_label.setText(tr("pc.workflow_pending"))
         if hasattr(self, "flow_target_label") and self._selected_robot_target_raw_m is None:
