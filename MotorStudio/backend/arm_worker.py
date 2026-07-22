@@ -33,6 +33,9 @@ class ArmWorker(QThread):
     - 通过命令队列接收 UI 的控制指令
     """
 
+    CONTROL_LOOP_RATE_HZ = 200.0
+    CONTROL_LOOP_ENABLE_SETTLE_S = 0.3
+
     joints_updated = pyqtSignal(object)
     velocities_updated = pyqtSignal(object)
     efforts_updated = pyqtSignal(object)
@@ -292,6 +295,11 @@ class ArmWorker(QThread):
             return
         try:
             self.arm.EnableArm()
+            self._start_control_loop_if_needed(
+                rate_hz=self.CONTROL_LOOP_RATE_HZ,
+                settle_s=self.CONTROL_LOOP_ENABLE_SETTLE_S,
+                reason="使能后",
+            )
             self._enabled = True
             self.enabled_changed.emit(True)
             self.log_message.emit("电机已使能")
@@ -329,11 +337,32 @@ class ArmWorker(QThread):
             self.error_occurred.emit(f"急停失败: {e}")
 
     def _ensure_control_loop(self):
-        """运动命令前自动启动控制循环（200Hz EMA 平滑 + 速度前馈 + 重力补偿）"""
-        if self.arm and not self.arm.control_loop_running:
-            self.arm.start_control_loop(rate_hz=200.0)
-            self.control_loop_changed.emit(True)
-            self.log_message.emit("控制循环已自动启动 (200Hz)")
+        """运动命令前兜底确认控制循环已启动。"""
+        self._start_control_loop_if_needed(
+            rate_hz=self.CONTROL_LOOP_RATE_HZ,
+            settle_s=0.0,
+            reason="运动前兜底",
+        )
+
+    def _start_control_loop_if_needed(
+        self,
+        *,
+        rate_hz: float,
+        settle_s: float = 0.0,
+        reason: str = "",
+    ) -> bool:
+        if not self.arm:
+            return False
+        if self.arm.control_loop_running:
+            return False
+        self.arm.start_control_loop(rate_hz=rate_hz)
+        self.control_loop_changed.emit(True)
+        label = f"{reason}控制循环已启动" if reason else "控制循环已启动"
+        self.log_message.emit(f"{label} ({rate_hz:.0f}Hz)")
+        if settle_s > 0.0:
+            time.sleep(float(settle_s))
+            self.log_message.emit(f"控制循环预热完成 ({settle_s:.1f}s)")
+        return True
 
     def _do_joint_ctrl(self, positions: List[float]):
         if self._sim_mode:
@@ -721,10 +750,12 @@ class ArmWorker(QThread):
             self.control_loop_changed.emit(True)
             self.log_message.emit(f"控制循环已启动（模拟）{rate_hz}Hz")
             return
-        if self.arm:
-            self.arm.start_control_loop(rate_hz=rate_hz)
-            self.control_loop_changed.emit(True)
-            self.log_message.emit(f"控制循环已启动 {rate_hz}Hz")
+        started = self._start_control_loop_if_needed(
+            rate_hz=float(rate_hz),
+            settle_s=0.0,
+        )
+        if not started and self.arm and self.arm.control_loop_running:
+            self.log_message.emit(f"控制循环已在运行 {float(rate_hz):.0f}Hz")
 
     def _do_stop_control_loop(self):
         if self._sim_mode:

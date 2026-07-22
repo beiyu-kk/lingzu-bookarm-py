@@ -6576,7 +6576,7 @@ class RealSensePointPanel(QWidget):
 
     def _execute_takeout_gripper_open_step(self):
         self._start_shared_gripper_open(
-            waiting_kind="manual_gripper_open",
+            waiting_kind="takeout_gripper_open",
             waiting_text=(
                 "等待步骤15夹爪缓慢打开到 "
                 f"{float(self.gripper_open_spin.value()):.1f}°"
@@ -7164,6 +7164,7 @@ class RealSensePointPanel(QWidget):
             "gripper_close",
             "manual_gripper_close",
             "manual_gripper_open",
+            "takeout_gripper_open",
             "putback_gripper_open",
             "tail_gripper_slight_open",
             "tail_home_gripper_close",
@@ -7186,6 +7187,7 @@ class RealSensePointPanel(QWidget):
         self._clear_manual_gripper_open()
         if self._flow_waiting_kind in {
             "manual_gripper_open",
+            "takeout_gripper_open",
             "putback_gripper_open",
             "tail_gripper_slight_open",
             "putback2_gripper_open",
